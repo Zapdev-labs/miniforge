@@ -10,7 +10,6 @@ async def main():
 
     # Configure for GMKtech M7
     config = M7Config(
-        n_ctx=8192,
         quantization="Q4_K_M",
         cache_type_k="turbo3",
         cache_type_v="turbo3",

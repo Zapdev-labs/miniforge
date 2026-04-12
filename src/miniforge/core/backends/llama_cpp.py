@@ -35,7 +35,7 @@ class LlamaCppBackend:
             )
 
         # Extract configuration with M7-optimized defaults
-        n_ctx = self.config.get("n_ctx", 8192)
+        n_ctx = self.config.get("n_ctx", 200_000)
         n_threads = self.config.get("n_threads", 8)
         n_batch = self.config.get("n_batch", 512)
         n_gpu_layers = self.config.get("n_gpu_layers", 0)

@@ -10,7 +10,7 @@ n_threads: 8               # Physical cores on Ryzen 7 PRO 6850H
 n_batch: 512               # Batch size for prompt processing
 
 # Model settings
-n_ctx: 8192                # Context window (8K is safe for 28GB)
+n_ctx: 200000          # 200k context (MiniMax-style; lower if you hit RAM limits)
 quantization: Q4_K_M       # Best quality/size tradeoff
 
 # KV cache compression (TurboQuant)

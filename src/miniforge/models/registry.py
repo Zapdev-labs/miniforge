@@ -5,6 +5,7 @@ from pathlib import Path
 from dataclasses import dataclass
 import hashlib
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,29 @@ class ModelRegistry:
         self.hf_dir = self.cache_dir / "huggingface"
         self.hf_dir.mkdir(exist_ok=True)
 
+    @staticmethod
+    def hf_hub_models_root() -> Path:
+        """Directory containing ``models--org--name`` (same tree as Transformers / ``hf`` CLI)."""
+        try:
+            from huggingface_hub.constants import HF_HUB_CACHE
+
+            return Path(HF_HUB_CACHE)
+        except Exception:
+            hf_home = os.environ.get("HF_HOME")
+            base = Path(hf_home).expanduser() if hf_home else Path.home() / ".cache" / "huggingface"
+            return base / "hub"
+
+    def model_id_to_cache_stem(self, model_id: str) -> str:
+        """Stable filename stem for GGUF cache entries (HF repo id or hashed local dir)."""
+        p = Path(model_id).expanduser()
+        try:
+            if p.is_dir():
+                digest = hashlib.sha256(str(p.resolve()).encode()).hexdigest()[:32]
+                return f"local-{digest}"
+        except OSError:
+            pass
+        return model_id.replace("\\", "--").replace("/", "--")
+
     def get_model_info(self, model_id: str) -> Optional[ModelInfo]:
         """Get information about a known model."""
         return MINIMAX_MODELS.get(model_id)
@@ -77,8 +101,7 @@ class ModelRegistry:
         Returns:
             Path if cached, None otherwise
         """
-        # Create deterministic filename
-        safe_name = model_id.replace("/", "--")
+        safe_name = self.model_id_to_cache_stem(model_id)
         filename = f"{safe_name}_{quantization}.gguf"
         cache_path = self.gguf_dir / filename
 
@@ -104,7 +127,7 @@ class ModelRegistry:
         Returns:
             Path in cache
         """
-        safe_name = model_id.replace("/", "--")
+        safe_name = self.model_id_to_cache_stem(model_id)
         filename = f"{safe_name}_{quantization}.gguf"
         cache_path = self.gguf_dir / filename
 
@@ -123,14 +146,10 @@ class ModelRegistry:
         local_files_only: bool = False,
     ) -> Path:
         """
-        Download model from HuggingFace.
+        Resolve or download weights using the shared Hugging Face hub cache
+        (e.g. ``%USERPROFILE%\\.cache\\huggingface\\hub\\models--Org--Name`` on Windows).
 
-        Args:
-            model_id: HuggingFace model ID
-            local_files_only: Only use local cache
-
-        Returns:
-            Path to downloaded model
+        Returns the snapshot directory (config + weights) suitable for conversion or inspection.
         """
         try:
             from huggingface_hub import snapshot_download
@@ -139,20 +158,12 @@ class ModelRegistry:
                 "huggingface-hub not installed. Install with: uv pip install huggingface-hub"
             )
 
-        cache_path = self.hf_dir / model_id.replace("/", "--")
-
-        if local_files_only and not cache_path.exists():
-            raise FileNotFoundError(f"Model not found locally: {model_id}")
-
-        if not local_files_only:
-            logger.info(f"Downloading {model_id}...")
-            snapshot_download(
-                repo_id=model_id,
-                local_dir=cache_path,
-                local_dir_use_symlinks=False,
-            )
-
-        return cache_path
+        logger.info("Resolving %s in Hugging Face hub cache...", model_id)
+        out = snapshot_download(
+            repo_id=model_id,
+            local_files_only=local_files_only,
+        )
+        return Path(out)
 
     def find_gguf_in_repo(self, repo_path: Path) -> Optional[Path]:
         """
@@ -190,11 +201,18 @@ class ModelRegistry:
             name = gguf_file.stem.replace("--", "/")
             models.append(f"[GGUF] {name}")
 
-        # List HF models
-        for hf_dir in self.hf_dir.iterdir():
-            if hf_dir.is_dir():
-                name = hf_dir.name.replace("--", "/")
-                models.append(f"[HF] {name}")
+        hub = self.hf_hub_models_root()
+        if hub.is_dir():
+            for entry in sorted(hub.glob("models--*")):
+                if entry.is_dir():
+                    rest = entry.name.removeprefix("models--")
+                    repo_id = rest.replace("--", "/", 1) if "--" in rest else rest
+                    models.append(f"[HF hub] {repo_id}")
+
+        for legacy in self.hf_dir.iterdir():
+            if legacy.is_dir():
+                name = legacy.name.replace("--", "/")
+                models.append(f"[HF legacy] {name}")
 
         return models
 

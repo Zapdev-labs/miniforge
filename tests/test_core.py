@@ -37,7 +37,7 @@ def test_memory_manager_calculate_max_context():
     # With 3.1GB model, should get good context
     max_ctx = mem.calculate_max_context(3.1, "turbo3")
     assert max_ctx >= 4096
-    assert max_ctx <= 131072
+    assert max_ctx <= 200_000
 
 
 def test_memory_stats():
@@ -58,7 +58,7 @@ def test_m7_config_defaults():
     config = M7Config()
 
     assert config.n_threads == 8
-    assert config.n_ctx == 8192
+    assert config.n_ctx == 200_000
     assert config.quantization == "Q4_K_M"
     assert config.cache_type_k == "turbo3"
     assert config.max_memory_gb == 24.0

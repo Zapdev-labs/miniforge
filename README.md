@@ -24,6 +24,8 @@ cd miniforge
 uv pip install -e ".[all]"
 ```
 
+The default install omits `llama-cpp-python` so editable installs work on Windows without the Visual Studio C++ toolchain. For the `llama_cpp` GGUF backend, run `uv pip install -e ".[llama-cpp]"` (on Windows you need [Build Tools for Visual Studio](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the C++ workload, or a matching prebuilt wheel). The `[all]` extra is server plus dev tools only and does not pull in `llama-cpp-python`.
+
 ```python
 import asyncio
 from miniforge import Miniforge
@@ -68,7 +70,7 @@ Create `~/.config/miniforge/config.yaml`:
 
 ```yaml
 max_memory_gb: 24.0
-n_ctx: 8192
+n_ctx: 200000
 quantization: Q4_K_M
 cache_type_k: turbo3
 cache_type_v: turbo3
@@ -107,6 +109,8 @@ model = await Miniforge.from_pretrained(
 )
 ```
 
+If no prebuilt GGUF is on the Hub, Miniforge can convert SafeTensors weights automatically using a local [llama.cpp](https://github.com/ggml-org/llama.cpp) checkout: install its Python requirements, build `llama-quantize` (for Q4_K_M etc.), then set `MINIFORGE_LLAMA_CPP` to the repo root (or `llama_cpp_path` in `M7Config` / YAML). The converter runs `convert_hf_to_gguf.py` and caches the result under your miniforge GGUF cache. If conversion is not configured or fails, the library falls back to the Transformers backend as before.
+
 ### Transformers (Fallback)
 Native HF support with bitsandbytes:
 
@@ -134,7 +138,7 @@ max_ctx = mem.calculate_max_context(
     model_quantized_gb=3.1,
     kv_cache_type="turbo3",
 )
-# Returns: 8192 (or less if needed)
+# Returns: up to 200000 (or less if memory-constrained)
 ```
 
 ## Tool Calling

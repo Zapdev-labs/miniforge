@@ -99,15 +99,15 @@ class MemoryManager:
         # KV cache overhead with TurboQuant
         # turbo3 = 3-bit = ~14KB per token for 2.7B model
         # turbo4 = 4-bit = ~18KB per token for 2.7B model
-        kv_per_token_kb = 14  # turbo3
-        context_tokens = 8192  # default context
-        kv_overhead_gb = (kv_per_token_kb * context_tokens) / (1024**3)
+        kv_per_token_kb = 14  # turbo3 (~14 KiB / token for ~2.7B, rough)
+        context_tokens = 200_000  # align with default M7Config n_ctx
+        kv_overhead_gb = (kv_per_token_kb * context_tokens) / (1024**2)
 
-        # Working memory for activations (rough estimate)
         working_memory_gb = 2.0
 
-        # Find best quantization that fits
-        for quant, ratio in quant_sizes.items():
+        preference = ["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "Q3_K_M", "Q2_K"]
+        for quant in preference:
+            ratio = quant_sizes[quant]
             model_size = fp16_size_gb * ratio
             total_needed = model_size + kv_overhead_gb + working_memory_gb
 
@@ -122,8 +122,7 @@ class MemoryManager:
                 )
                 return quant
 
-        # If nothing fits, return most aggressive
-        logger.warning(f"Model may not fit in memory, using Q2_K")
+        logger.warning("Model may not fit in memory, using Q2_K")
         return "Q2_K"
 
     def calculate_max_context(
@@ -166,7 +165,7 @@ class MemoryManager:
         max_tokens = int((available_gb * 1024**3) / bytes_per_token)
 
         # Round to common context sizes
-        context_sizes = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+        context_sizes = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 200_000]
         safe_context = 512
         for size in context_sizes:
             if size <= max_tokens:

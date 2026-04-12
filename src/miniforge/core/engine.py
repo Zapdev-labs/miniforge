@@ -21,8 +21,11 @@ class InferenceEngine:
         model_path: Union[str, Path],
         backend: str = "llama_cpp",
         config: Optional[Dict[str, Any]] = None,
-    ):
-        self.model_path = Path(model_path)
+    ) -> None:
+        if backend == "llama_cpp":
+            self.model_path = Path(model_path)
+        else:
+            self.model_path = model_path
         self.backend_name = backend
         self.config = config or {}
         self._backend = None

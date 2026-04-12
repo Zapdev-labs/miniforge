@@ -7,7 +7,8 @@ import logging
 
 from miniforge.core.engine import InferenceEngine
 from miniforge.core.memory import MemoryManager
-from miniforge.models.registry import ModelRegistry, get_registry
+from miniforge.models.gguf_convert import auto_convert_safetensors_to_gguf
+from miniforge.models.registry import get_registry
 from miniforge.utils.config import M7Config, load_config
 from miniforge.generation.tools import Tool, ToolExecutor
 from miniforge.multimodal.vision import VisionProcessor
@@ -149,13 +150,17 @@ class Miniforge:
                         for q in [quantization, "Q4_K_M", "Q5_K_M"]:
                             try:
                                 filename = f"{model_id.split('/')[-1]}-{q}.gguf"
-                                gguf_file = await asyncio.get_event_loop().run_in_executor(
-                                    None,
-                                    lambda: hf_hub_download(
+
+                                def _hub_dl() -> str:
+                                    return hf_hub_download(
                                         repo_id=repo,
                                         filename=filename,
                                         local_dir=str(self._registry.gguf_dir),
-                                    ),
+                                    )
+
+                                gguf_file = await asyncio.get_event_loop().run_in_executor(
+                                    None,
+                                    _hub_dl,
                                 )
                                 break
                             except Exception:
@@ -168,15 +173,26 @@ class Miniforge:
                 if gguf_file:
                     model_path = Path(gguf_file)
                 else:
-                    raise FileNotFoundError("No GGUF found, need to convert")
+                    loop = asyncio.get_event_loop()
+
+                    def _to_gguf() -> Path:
+                        return auto_convert_safetensors_to_gguf(
+                            self._registry,
+                            model_id,
+                            quantization,
+                            llama_cpp_root=self.config.llama_cpp_path,
+                        )
+
+                    model_path = await loop.run_in_executor(None, _to_gguf)
 
             except Exception as e:
-                logger.warning(f"Could not download GGUF: {e}")
+                logger.warning(f"Could not get GGUF (download or convert): {e}")
                 logger.info("Falling back to transformers backend")
                 self.backend_name = "transformers"
-                model_path = Path(model_id)
+                model_path = model_id
         else:
-            model_path = Path(model_id)
+            trial = Path(model_id)
+            model_path = trial if trial.exists() else model_id
 
         # Initialize engine
         backend_config = self.config.get_backend_config()

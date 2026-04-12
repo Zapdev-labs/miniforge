@@ -1,11 +1,33 @@
 """Transformers backend for native HuggingFace models."""
 
-from typing import Optional, Dict, Any, List, AsyncIterator
+from typing import Optional, Dict, Any, List, AsyncIterator, Union
 from pathlib import Path
 import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_pretrained_source(model_path: Union[str, Path]) -> Union[str, Path]:
+    """
+    Path('org/model') uses backslashes on Windows, which breaks HF hub repo ids.
+    Use the original string or as_posix() when the path is not a real filesystem location.
+    """
+    if isinstance(model_path, str):
+        p = Path(model_path).expanduser()
+        try:
+            if p.exists():
+                return p
+        except OSError:
+            pass
+        return model_path
+    p = model_path.expanduser()
+    try:
+        if p.exists():
+            return p
+    except OSError:
+        pass
+    return p.as_posix()
 
 
 class TransformersBackend:
@@ -16,8 +38,8 @@ class TransformersBackend:
     Supports quantization via BitsAndBytes.
     """
 
-    def __init__(self, model_path: Path, config: Dict[str, Any]):
-        self.model_path = model_path
+    def __init__(self, model_path: Union[str, Path], config: Dict[str, Any]):
+        self.model_path = resolve_pretrained_source(model_path)
         self.config = config
         self._model = None
         self._tokenizer = None

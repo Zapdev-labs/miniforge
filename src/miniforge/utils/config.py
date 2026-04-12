@@ -1,12 +1,14 @@
 """Configuration management for Miniforge."""
 
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional, Union
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 import yaml
 import logging
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MODEL_ID = "MiniMaxAI/MiniMax-M2.7"
 
 
 @dataclass
@@ -29,7 +31,9 @@ class M7Config:
     n_batch: int = 512
 
     # Model settings
-    n_ctx: int = 8192
+    model_id: str = DEFAULT_MODEL_ID
+    model_weights_path: Optional[str] = None
+    n_ctx: int = 200_000
     quantization: str = "Q4_K_M"
 
     # KV cache compression (TurboQuant)
@@ -57,6 +61,7 @@ class M7Config:
 
     # Paths
     cache_dir: Optional[str] = None
+    llama_cpp_path: Optional[str] = None
 
     # Logging
     verbose: bool = False
@@ -133,6 +138,12 @@ class M7Config:
             "top_k": self.default_top_k,
         }
 
+    def resolved_model_weights_dir(self) -> Optional[Path]:
+        """If set, weights are stored and loaded only from this folder (no duplicate hub cache)."""
+        if not self.model_weights_path:
+            return None
+        return Path(self.model_weights_path).expanduser()
+
 
 def load_config(config_path: Optional[Union[str, Path]] = None) -> M7Config:
     """
@@ -173,6 +184,3 @@ def create_default_config_file(path: Optional[Union[str, Path]] = None) -> Path:
     config.to_yaml(path)
 
     return path
-
-
-from typing import Union
