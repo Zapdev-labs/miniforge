@@ -1,0 +1,44 @@
+# Miniforge Optimized Configuration
+# For GMKtech M7 (AMD Ryzen 7 PRO 6850H, 28GB RAM)
+
+# Hardware constraints
+max_memory_gb: 24.0        # Leave 4GB for OS/WSL2
+reserve_memory_gb: 4.0
+
+# CPU settings  
+n_threads: 8               # Physical cores on Ryzen 7 PRO 6850H
+n_batch: 512               # Batch size for prompt processing
+
+# Model settings
+n_ctx: 8192                # Context window (8K is safe for 28GB)
+quantization: Q4_K_M       # Best quality/size tradeoff
+
+# KV cache compression (TurboQuant)
+cache_type_k: turbo3       # 3-bit compression = 4.9x smaller
+cache_type_v: turbo3       # Same for values
+
+# Performance features
+flash_attn: true           # Faster attention
+use_mmap: true            # Memory-mapped file loading
+use_mlock: false          # WSL2 doesn't support mlock well
+
+# Backend selection
+backend: llama_cpp         # llama_cpp or transformers
+
+# Generation defaults
+default_max_tokens: 512
+default_temperature: 1.0
+default_top_p: 0.95
+default_top_k: 40
+
+# Feature flags
+enable_tools: true
+enable_vision: true
+enable_streaming: true
+
+# Paths (null = use default)
+cache_dir: null
+
+# Logging
+verbose: false
+log_level: INFO
