@@ -1,0 +1,144 @@
+\section{Appendix C: Code Repository}
+\label{appendix:code}
+
+\subsection{Repository Structure}
+
+Miniforge is available at \url{https://github.com/Zapdev-labs/miniforge}.
+
+\begin{verbatim}
+miniforge/
+|-- src/miniforge/           # Main package
+|   |-- __init__.py
+|   |-- core/               # Core engine
+|   |-- models/             # Model management
+|   |-- generation/         # Generation utilities
+|   |-- multimodal/         # Vision support
+|   -- utils/              # Utilities
+|-- benchmarks/             # Benchmark suite
+|-- tests/                  # Test suite
+|-- examples/               # Usage examples
+|-- paper/                  # This paper
+|-- configs/                # Sample configurations
+|-- README.md
+|-- pyproject.toml
+-- LICENSE
+\end{verbatim}
+
+\subsection{Installation}
+
+\subsubsection{Quick Install}
+
+\begin{verbatim}
+pip install miniforge
+\end{verbatim}
+
+\subsubsection{Development Install}
+
+\begin{verbatim}
+git clone https://github.com/Zapdev-labs/miniforge.git
+cd miniforge
+uv pip install -e ".[all]"
+\end{verbatim}
+
+\subsection{Quick Start Example}
+
+\begin{lstlisting}[language=Python, caption=Basic Usage]
+import asyncio
+from miniforge import Miniforge
+
+async def main():
+    # Load model
+    model = await Miniforge.from_pretrained(
+        "MiniMaxAI/MiniMax-M2.7",
+        quantization="Q4_K_M",
+    )
+    
+    # Simple chat
+    response = await model.chat(
+        "Explain quantum computing",
+        system_prompt="You are a helpful assistant.",
+    )
+    print(response)
+    
+    # Streaming
+    stream = await model.chat(
+        "Tell me a story",
+        stream=True
+    )
+    async for token in stream:
+        print(token, end="", flush=True)
+    
+    # Cleanup
+    await model.cleanup()
+
+asyncio.run(main())
+\end{lstlisting}
+
+\subsection{Running Benchmarks}
+
+\begin{verbatim}
+# Run all benchmarks
+python -m benchmarks.runner
+
+# Run specific benchmarks
+python -m benchmarks.runner --benchmarks performance memory
+
+# Generate HTML report
+python -m benchmarks.runner --html-only --report results/benchmark_*.json
+\end{verbatim}
+
+\subsection{License}
+
+Miniforge is released under the MIT License:
+
+\begin{verbatim}
+MIT License
+
+Copyright (c) 2026 Zapdev Labs
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+\end{verbatim}
+
+\subsection{Contributing}
+
+Contributions are welcome! Areas of particular interest:
+
+\begin{itemize}
+    \item Additional benchmark tasks
+    \item Hardware-specific optimizations
+    \item Bug fixes and performance improvements
+    \item Documentation improvements
+    \item New backend integrations
+\end{itemize}
+
+\subsection{Acknowledgments}
+
+Miniforge builds upon several open-source projects:
+
+\begin{itemize}
+    \item llama.cpp by Georgi Gerganov
+    \item Transformers by HuggingFace
+    \item llama-cpp-python by Andrei Betlen
+    \item MiniMax model by MiniMax AI
+\end{itemize}
+
+\subsection{Contact}
+
+For questions or issues:
+
+\begin{itemize}
+    \item GitHub Issues: \url{https://github.com/Zapdev-labs/miniforge/issues}
+    \item Email: jacksonwheeler@zapdev.link
+\end{itemize}

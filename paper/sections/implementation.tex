@@ -1,0 +1,259 @@
+\section{Implementation Details}
+\label{sec:implementation}
+
+\subsection{Code Organization}
+
+Miniforge follows a modular package structure:
+
+\begin{lstlisting}[language=bash, caption=Package Structure]
+miniforge/
+|-- __init__.py          # Main exports
+|-- core/                # Core engine
+|   |-- engine.py        # InferenceEngine
+|   |-- memory.py        # MemoryManager
+|   -- backends/        # Backend implementations
+|       |-- llama_cpp.py
+|       -- transformers.py
+|-- models/              # Model management
+|   |-- minimax.py       # Main interface
+|   |-- registry.py      # Model registry
+|   -- gguf_convert.py  # Conversion utilities
+|-- generation/           # Generation utilities
+|   |-- streaming.py
+|   -- tools.py
+|-- multimodal/          # Vision support
+|   -- vision.py
+-- utils/               # Utilities
+    -- config.py        # M7Config
+\end{lstlisting}
+
+\subsection{Async Implementation}
+
+Async programming patterns throughout Miniforge:
+
+\subsubsection{Thread Pool Delegation}
+
+CPU-intensive operations run in thread pools to avoid blocking:
+
+\begin{lstlisting}[language=Python, caption=Thread Pool Pattern]
+async def generate(self, prompt: str, **kwargs) -> str:
+    if not self._initialized:
+        await self.initialize()
+    
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,  # Default executor
+        lambda: self._llm.create_completion(
+            prompt=prompt, **kwargs
+        )
+    )
+    return result["choices"][0]["text"]
+\end{lstlisting}
+
+\subsubsection{Streaming with Async Generators}
+
+Token streaming uses async generators:
+
+\begin{lstlisting}[language=Python, caption=Streaming Implementation]
+async def generate_stream(self, prompt: str, **kwargs):
+    loop = asyncio.get_event_loop()
+    
+    stream = await loop.run_in_executor(
+        None,
+        lambda: self._llm.create_completion(
+            prompt=prompt, stream=True, **kwargs
+        )
+    )
+    
+    for chunk in stream:
+        text = chunk["choices"][0].get("text", "")
+        if text:
+            yield text
+        await asyncio.sleep(0)  # Yield control
+\end{lstlisting}
+
+\subsection{Configuration Management}
+
+Configuration uses dataclasses with validation:
+
+\begin{lstlisting}[language=Python, caption=Configuration Dataclass]
+@dataclass
+class M7Config:
+    max_memory_gb: float = 24.0
+    n_threads: int = 8
+    n_ctx: int = 194_560
+    quantization: str = "Q4_K_M"
+    cache_type_k: str = "turbo3"
+    cache_type_v: str = "turbo3"
+    flash_attn: bool = True
+    
+    def __post_init__(self):
+        # Validation
+        valid_quants = ["Q2_K", "Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"]
+        if self.quantization not in valid_quants:
+            self.quantization = "Q4_K_M"
+\end{lstlisting}
+
+\subsection{Error Handling}
+
+Comprehensive error handling with graceful degradation:
+
+\begin{lstlisting}[language=Python, caption=Error Handling]
+try:
+    from llama_cpp import Llama
+except ImportError:
+    raise ImportError(
+        "llama-cpp-python not installed. "
+        "Install with: uv pip install llama-cpp-python"
+    )
+
+# Context fallback
+for candidate_ctx in _context_fallbacks(requested_n_ctx, max_safe_ctx):
+    kwargs["n_ctx"] = candidate_ctx
+    try:
+        self._llm = await loop.run_in_executor(
+            None, lambda: Llama(**kwargs)
+        )
+        break
+    except ValueError as exc:
+        logger.warning(f"Failed with n_ctx={candidate_ctx}: {exc}")
+        continue
+\end{lstlisting}
+
+\subsection{Memory Management Implementation}
+
+Memory tracking uses psutil for system monitoring:
+
+\begin{lstlisting}[language=Python, caption=Memory Monitoring]
+def get_stats(self) -> MemoryStats:
+    mem = psutil.virtual_memory()
+    return MemoryStats(
+        total_gb=mem.total / (1024**3),
+        available_gb=mem.available / (1024**3),
+        used_gb=mem.used / (1024**3),
+        percent_used=mem.percent,
+        model_memory_gb=self.current_model_memory,
+        kv_cache_gb=self.current_kv_memory,
+    )
+\end{lstlisting}
+
+\subsection{Tool Calling Implementation}
+
+Tool calling support with async execution:
+
+\begin{lstlisting}[language=Python, caption=Tool Execution]
+async def execute_single(self, tool_call: ToolCall) -> ToolResult:
+    name = tool_call.name
+    handler = self._handlers[name]
+    
+    try:
+        if asyncio.iscoroutinefunction(handler):
+            result = await handler(**tool_call.arguments)
+        else:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: handler(**tool_call.arguments)
+            )
+        
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            content=str(result),
+            is_error=False,
+        )
+    except Exception as e:
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            content=f"Error: {e}",
+            is_error=True,
+        )
+\end{lstlisting}
+
+\subsection{Vision Processing}
+
+Vision support with PIL for image handling:
+
+\begin{lstlisting}[language=Python, caption=Vision Processing]
+class VisionProcessor:
+    def preprocess(self, image, target_size=None):
+        from PIL import Image
+        
+        if not isinstance(image, Image.Image):
+            img = self.load_image(image)
+        else:
+            img = image
+        
+        # Convert to RGB
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        
+        # Resize
+        if target_size:
+            img = img.resize(target_size, Image.Resampling.LANCZOS)
+        elif max(img.size) > self.max_size:
+            img.thumbnail((self.max_size, self.max_size))
+        
+        return img
+    
+    def encode_base64(self, image, format="PNG") -> str:
+        img = self.preprocess(image)
+        buffer = BytesIO()
+        img.save(buffer, format=format)
+        return base64.b64encode(buffer.getvalue()).decode()
+\end{lstlisting}
+
+\subsection{Type Safety}
+
+Strict typing throughout the codebase:
+
+\begin{lstlisting}[language=Python, caption=Type Annotations]
+from typing import Optional, Dict, Any, List, AsyncIterator, Union
+
+async def chat(
+    self,
+    message: str,
+    history: Optional[List[Dict[str, str]]] = None,
+    system_prompt: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    tools: Optional[List[Tool]] = None,
+    stream: bool = False,
+) -> Union[str, AsyncIterator[str]]:
+    ...
+\end{lstlisting}
+
+\subsection{Testing Strategy}
+
+Comprehensive test coverage:
+
+\begin{itemize}
+    \item \textbf{Unit tests:} Individual component testing
+    \item \textbf{Integration tests:} End-to-end workflows
+    \item \textbf{Benchmark tests:} Performance regression detection
+    \item \textbf{Memory tests:} OOM prevention validation
+\end{itemize}
+
+\begin{lstlisting}[language=Python, caption=Example Test]
+def test_memory_manager_select_quantization():
+    mem = MemoryManager()
+    
+    # 2.7B model should fit with Q4_K_M
+    quant = mem.select_quantization(2.7)
+    assert quant in ["Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K"]
+    
+    # 7B model might need more aggressive quantization
+    quant_7b = mem.select_quantization(7.0)
+    assert quant_7b in ["Q3_K_M", "Q4_K_M"]
+\end{lstlisting}
+
+\subsection{Documentation}
+
+Documentation includes:
+
+\begin{itemize}
+    \item Docstrings for all public APIs
+    \item Type hints for function signatures
+    \item Usage examples in docstrings
+    \item README with quickstart guide
+    \item Architecture documentation
+\end{itemize}

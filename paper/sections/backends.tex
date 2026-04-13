@@ -1,0 +1,175 @@
+\section{Inference Backends}
+\label{sec:backends}
+
+\subsection{Backend Architecture}
+
+Miniforge abstracts over multiple inference backends through a unified interface, enabling platform-appropriate deployment and graceful fallback.
+
+\subsubsection{Backend Interface}
+
+All backends implement the common interface:
+
+\begin{lstlisting}[language=Python, caption=Backend Interface]
+class InferenceBackend(ABC):
+    async def initialize(self) -> None: ...
+    
+    async def generate(
+        self, prompt: str, max_tokens: int,
+        temperature: float, top_p: float, top_k: int,
+        stop: Optional[List[str]]
+    ) -> str: ...
+    
+    async def generate_stream(
+        self, prompt: str, **kwargs
+    ) -> AsyncIterator[str]: ...
+    
+    async def get_info(self) -> Dict[str, Any]: ...
+    
+    async def cleanup(self) -> None: ...
+\end{lstlisting}
+
+\subsection{llama.cpp Backend}
+
+The llama.cpp backend provides optimized CPU inference with GGUF support.
+
+\subsubsection{Key Features}
+
+\begin{itemize}
+    \item GGUF quantization formats (Q4\_K\_M, Q5\_K\_M, etc.)
+    \item KV cache compression (TurboQuant)
+    \item Flash Attention
+    \item Multi-threading optimized for CPU
+    \item Cross-platform support
+\end{itemize}
+
+\subsubsection{Configuration Options}
+
+Key parameters for llama.cpp backend:
+
+\begin{lstlisting}[language=Python, caption=llama.cpp Configuration]
+config = {
+    "n_ctx": 194560,           # Context window
+    "n_threads": 8,            # CPU threads
+    "n_batch": 2048,           # Batch size
+    "n_ubatch": 512,           # Micro-batch size
+    "cache_type_k": "turbo3",  # Key cache quantization
+    "cache_type_v": "turbo3",  # Value cache quantization
+    "flash_attn": True,        # Enable Flash Attention
+    "use_mmap": True,          # Memory-map weights
+    "use_mlock": False,        # Disable (WSL2)
+}
+\end{lstlisting}
+
+\subsubsection{Context Fallback}
+
+When initialization fails due to memory constraints, the backend implements automatic context fallback:
+
+\begin{enumerate}
+    \item Try requested context size
+    \item If OOM, try progressively smaller sizes
+    \item Log warning about reduced context
+    \item Continue with successful size
+\end{enumerate}
+
+This ensures the model loads even under memory pressure.
+
+\subsection{Transformers Backend}
+
+The Transformers backend provides native HuggingFace compatibility as a fallback.
+
+\subsubsection{Use Cases}
+
+\begin{itemize}
+    \item When GGUF conversion is unavailable
+    \item For testing and debugging
+    \item When llama.cpp fails to initialize
+    \item For features not yet implemented in llama.cpp
+\end{itemize}
+
+\subsubsection{Configuration}
+
+Transformers backend uses PyTorch for inference:
+
+\begin{lstlisting}[language=Python, caption=Transformers Configuration]
+config = {
+    "torch_dtype": torch.float16,
+    "device_map": "auto",
+    "low_cpu_mem_usage": True,
+}
+\end{lstlisting}
+
+\subsubsection{Performance Comparison}
+
+Table \ref{tab:backend_comparison} compares backend performance.
+
+\begin{table}[h]
+\centering
+\caption{Backend Performance Comparison}
+\label{tab:backend_comparison}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{llama.cpp} & \textbf{Transformers} \\
+\midrule
+Throughput (tok/s) & 15-25 & 8-12 \\
+Memory Overhead & Low & High \\
+Startup Time & Fast & Slow \\
+Quantization Support & Native & Limited \\
+CPU Optimization & Excellent & Good \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Backend Selection Strategy}
+
+Miniforge automatically selects the appropriate backend:
+
+\begin{enumerate}
+    \item Attempt llama.cpp with requested quantization
+    \item If GGUF unavailable, try auto-conversion
+    \item If conversion fails, fall back to Transformers
+    \item User can override with explicit \texttt{backend=} parameter
+\end{enumerate}
+
+\subsection{Backend Fallback Mechanism}
+
+The fallback mechanism ensures robust deployment:
+
+\begin{lstlisting}[language=Python, caption=Backend Fallback]
+async def _load_model(self, quantization: str):
+    try:
+        # Try llama.cpp first
+        self.backend_name = "llama_cpp"
+        await self._try_load_llama_cpp(quantization)
+    except Exception as e:
+        logger.warning(f"llama.cpp failed: {e}")
+        
+        # Check if explicit GGUF repo
+        if "unsloth" in model_id or "-GGUF" in model_id:
+            raise  # Don't fallback for GGUF repos
+        
+        # Fallback to transformers
+        logger.info("Falling back to transformers backend")
+        self.backend_name = "transformers"
+        await self._try_load_transformers()
+\end{lstlisting}
+
+\subsection{Unified API Benefits}
+
+The unified backend abstraction provides:
+
+\begin{itemize}
+    \item \textbf{Portability:} Same code works across backends
+    \item \textbf{Robustness:} Automatic fallback on failures
+    \item \textbf{Flexibility:} Choose backend based on requirements
+    \item \textbf{Testing:} Easy to compare backend performance
+\end{itemize}
+
+\subsection{Future Backend Extensions}
+
+Potential future backends include:
+
+\begin{itemize}
+    \item \textbf{ONNX Runtime:} Cross-platform optimization
+    \item \textbf{TensorRT:} If GPU becomes available
+    \item \textbf{Custom Kernels:} Hand-optimized for specific hardware
+\end{itemize}

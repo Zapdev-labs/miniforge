@@ -1,0 +1,274 @@
+\section{System Architecture}
+\label{sec:architecture}
+
+\subsection{Design Principles}
+
+Miniforge is designed around five core principles that guide its architecture and implementation:
+
+\begin{enumerate}
+    \item \textbf{Async-First:} All operations are asynchronous by default, enabling concurrent processing and non-blocking APIs.
+    \item \textbf{Hardware-Aware:} System behavior adapts to available memory, CPU cores, and platform characteristics.
+    \item \textbf{Backend-Agnostic:} Clean abstraction over multiple inference backends with automatic fallback.
+    \item \textbf{Memory-Conservative:} Aggressive memory management with safety margins and automatic optimization.
+    \item \textbf{Quality-Preserving:} Quantization and compression decisions prioritize maintaining model capabilities.
+\end{enumerate}
+
+\subsection{High-Level Architecture}
+
+Figure \ref{fig:architecture} presents the high-level system architecture.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    box/.style={rectangle, draw, minimum width=3cm, minimum height=0.8cm, align=center},
+    arrow/.style={->, >=stealth, thick}
+]
+    % Input layer
+    \node[box, fill=blue!20] (api) {API Layer\\(Async Interface)};
+    
+    % Core layer
+    \node[box, fill=green!20, below of=api] (engine) {Inference Engine\\(Unified Backend)};
+    
+    % Backend layer
+    \node[box, fill=yellow!20, below left=1.5cm and 0.5cm of engine] (llama) {llama.cpp\\Backend};
+    \node[box, fill=yellow!20, below right=1.5cm and 0.5cm of engine] (transformers) {Transformers\\Backend};
+    
+    % Memory management
+    \node[box, fill=red!20, right=3cm of engine] (memory) {Memory\\Manager};
+    
+    % Configuration
+    \node[box, fill=purple!20, left=3cm of engine] (config) {Configuration\\(M7Config)};
+    
+    % Arrows
+    \draw[arrow] (api) -- (engine);
+    \draw[arrow] (engine) -- (llama);
+    \draw[arrow] (engine) -- (transformers);
+    \draw[arrow, <->] (engine) -- (memory);
+    \draw[arrow, <->] (engine) -- (config);
+    \draw[arrow, <->] (memory) -- (config);
+    
+    % Additional modules
+    \node[box, fill=orange!20, below=3cm of engine] (tools) {Tool\\Executor};
+    \node[box, fill=orange!20, right=0.5cm of tools] (vision) {Vision\\Processor};
+    \node[box, fill=orange!20, left=0.5cm of tools] (streaming) {Streaming\\Handler};
+    
+    \draw[arrow, <->] (engine) -- (tools);
+    \draw[arrow, <->] (engine) -- (vision);
+    \draw[arrow, <->] (engine) -- (streaming);
+    \draw[arrow, <->] (memory) -- (llama);
+    \draw[arrow, <->] (memory) -- (transformers);
+\end{tikzpicture}
+\caption{Miniforge System Architecture}
+\label{fig:architecture}
+\end{figure}
+
+The architecture consists of five layers:
+
+\subsubsection{API Layer}
+
+Provides user-facing interfaces for chat, completion, streaming, tool calling, and vision processing. All APIs are async-first with synchronous wrappers for convenience.
+
+\subsubsection{Inference Engine}
+
+The core abstraction layer managing backend initialization, request routing, and result aggregation. Implements the state machine for model lifecycle (loading $\rightarrow$ ready $\rightarrow$ generating $\rightarrow$ cleanup).
+
+\subsubsection{Backend Layer}
+
+Pluggable inference backends with shared interface. Currently implements:
+
+\begin{itemize}
+    \item \textbf{llama.cpp:} Primary backend for CPU-optimized GGUF inference
+    \item \textbf{Transformers:} Fallback for native HuggingFace model support
+\end{itemize}
+
+\subsubsection{Memory Management}
+
+Monitors system memory, tracks model and cache allocations, enforces limits, and triggers optimizations when approaching constraints.
+
+\subsubsection{Configuration}
+
+Hardware-specific configuration management with profiles for different platforms. The M7Config class encapsulates optimal settings for the GMKtech M7.
+
+\subsection{Module Interactions}
+
+The interaction flow for a typical chat request follows this sequence:
+
+\begin{enumerate}
+    \item User calls \texttt{model.chat()} with message and optional parameters
+    \item API layer validates and normalizes input
+    \item InferenceEngine formats messages into prompt template
+    \item MemoryManager checks available resources
+    \item Backend initializes if not already loaded
+    \item Generation proceeds with optional streaming
+    \item Results returned through API layer
+\end{enumerate}
+
+For streaming requests, tokens are yielded through an async iterator as they become available, rather than accumulating the complete response.
+
+\subsection{Component Specifications}
+
+\subsubsection{Miniforge Class}
+
+The main user-facing interface encapsulates model management:
+
+\begin{lstlisting}[language=Python, caption=Miniforge Interface]
+class Miniforge:
+    async def chat(
+        self,
+        message: str,
+        history: Optional[List[Dict]] = None,
+        system_prompt: Optional[str] = None,
+        tools: Optional[List[Tool]] = None,
+        stream: bool = False,
+        **generation_params
+    ) -> Union[str, AsyncIterator[str]]
+    
+    async def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 512,
+        temperature: float = 1.0,
+        stream: bool = False,
+    ) -> Union[str, AsyncIterator[str]]
+    
+    async def chat_vision(
+        self,
+        message: str,
+        image: Union[str, Path],
+        **kwargs
+    ) -> str
+    
+    def get_memory_stats(self) -> Dict[str, float]
+    
+    async def cleanup(self) -> None
+\end{lstlisting}
+
+\subsubsection{InferenceEngine}
+
+The unified inference backend abstraction:
+
+\begin{lstlisting}[language=Python, caption=InferenceEngine Interface]
+class InferenceEngine:
+    def __init__(
+        self,
+        model_path: Union[str, Path],
+        backend: str = "llama_cpp",
+        config: Optional[Dict[str, Any]] = None,
+    )
+    
+    async def initialize(self) -> None
+    
+    async def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 512,
+        temperature: float = 1.0,
+        top_p: float = 0.95,
+        top_k: int = 40,
+        stream: bool = False,
+    ) -> Union[str, AsyncIterator[str]]
+    
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        **generation_params
+    ) -> Union[str, AsyncIterator[str]]
+    
+    async def cleanup(self) -> None
+\end{lstlisting}
+
+\subsubsection{MemoryManager}
+
+The memory management subsystem tracks allocations and enforces limits:
+
+\begin{lstlisting}[language=Python, caption=MemoryManager Key Methods]
+class MemoryManager:
+    # Hardware limits
+    TOTAL_RAM_GB = 28.0
+    RESERVE_OS_GB = 4.0
+    MAX_AVAILABLE_GB = 24.0
+    SAFETY_FACTOR = 0.85
+    
+    def select_quantization(
+        self,
+        model_params_billions: float
+    ) -> str
+    
+    def calculate_max_context(
+        self,
+        model_quantized_gb: float,
+        kv_cache_type: str = "turbo3",
+    ) -> int
+    
+    def get_optimal_settings(
+        self,
+        model_params_billions: float
+    ) -> Dict[str, Any]
+    
+    def check_memory_available(
+        self,
+        required_gb: float
+    ) -> bool
+\end{lstlisting}
+
+\subsection{Async Architecture}
+
+Miniforge's async-first design provides several advantages:
+
+\begin{enumerate}
+    \item \textbf{Non-blocking:} Multiple concurrent requests can be processed without blocking the event loop
+    \item \textbf{Streaming:} Natural fit for streaming token generation
+    \item \textbf{Resource Sharing:} Concurrent tasks can share model weights while having separate KV caches
+    \item \textbf{Integration:} Compatible with modern async web frameworks (FastAPI, Sanic, etc.)
+\end{enumerate}
+
+The implementation uses Python's \texttt{asyncio} with thread pool delegation for CPU-intensive operations:
+
+\begin{lstlisting}[language=Python, caption=Async Pattern in Miniforge]
+async def generate(self, prompt: str, **kwargs) -> str:
+    if not self._initialized:
+        await self.initialize()
+    
+    # Run blocking backend call in thread pool
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,  # Default executor
+        lambda: self._backend.generate_sync(prompt, **kwargs)
+    )
+    return result
+\end{lstlisting}
+
+\subsection{Error Handling and Recovery}
+
+The architecture includes robust error handling at multiple levels:
+
+\begin{itemize}
+    \item \textbf{Backend Fallback:} If llama.cpp fails to load, automatically falls back to transformers
+    \item \textbf{Context Fallback:} If requested context exceeds available memory, gradually reduces context size until initialization succeeds
+    \item \textbf{OOM Prevention:} MemoryManager rejects requests that would exceed available memory
+    \item \textbf{Graceful Degradation:} Reduces batch size or quantization level under memory pressure
+\end{itemize}
+
+\subsection{Extension Points}
+
+The architecture supports future extensions through well-defined interfaces:
+
+\begin{itemize}
+    \item \textbf{New Backends:} Implement the backend interface to add support for additional inference engines
+    \item \textbf{Custom Tools:} Tool handlers can be arbitrary Python functions, sync or async
+    \item \textbf{Vision Models:} VisionProcessor can be extended for different image encoding schemes
+    \item \textbf{Streaming Handlers:} Custom streaming strategies can be implemented for different use cases
+\end{itemize}
+
+\subsection{Thread Safety and Concurrency}
+
+Model weights are read-only after initialization, enabling safe concurrent access. However, the KV cache and generation state are per-request. The implementation uses:\
+
+\begin{itemize}
+    \item \texttt{asyncio.Lock} for exclusive access during generation
+    \item Thread-local storage for request-specific state
+    \item Immutable model configuration shared across requests
+\end{itemize}
+
+This design enables multiple concurrent generations while maintaining correctness.
