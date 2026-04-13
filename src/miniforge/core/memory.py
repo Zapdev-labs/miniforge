@@ -96,11 +96,11 @@ class MemoryManager:
             "Q2_K": 0.25,  # 25% of FP16 (aggressive)
         }
 
-        # KV cache overhead with TurboQuant
+        # KV cache overhead with TurboQuant for full 192K context
         # turbo3 = 3-bit = ~14KB per token for 2.7B model
-        # turbo4 = 4-bit = ~18KB per token for 2.7B model
+        # For 194,560 tokens (192K usable): ~2.6 GB KV cache
         kv_per_token_kb = 14  # turbo3 (~14 KiB / token for ~2.7B, rough)
-        context_tokens = 200_000  # align with default M7Config n_ctx
+        context_tokens = 194_560  # Full 192K context window
         kv_overhead_gb = (kv_per_token_kb * context_tokens) / (1024**2)
 
         working_memory_gb = 2.0
@@ -164,8 +164,8 @@ class MemoryManager:
         # Calculate max tokens
         max_tokens = int((available_gb * 1024**3) / bytes_per_token)
 
-        # Round to common context sizes
-        context_sizes = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 200_000]
+        # Round to common context sizes including full 192K
+        context_sizes = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 194_560, 200_000]
         safe_context = 512
         for size in context_sizes:
             if size <= max_tokens:
@@ -243,13 +243,19 @@ class MemoryManager:
         # CPU threads - use physical cores (8 for Ryzen 7 PRO 6850H)
         cpu_count = psutil.cpu_count(logical=False) or 4
 
-        # Batch size based on available memory
-        if max_ctx >= 8192:
-            batch_size = 512
+        # Batch size optimized for context window (larger = better throughput)
+        if max_ctx >= 131072:  # Full 192K context
+            batch_size = 2048
+            ubatch_size = 512
+        elif max_ctx >= 8192:
+            batch_size = 1024
+            ubatch_size = 512
         elif max_ctx >= 4096:
-            batch_size = 256
+            batch_size = 512
+            ubatch_size = 256
         else:
-            batch_size = 128
+            batch_size = 256
+            ubatch_size = 128
 
         settings = {
             "quantization": quant,
@@ -258,6 +264,7 @@ class MemoryManager:
             "cache_type_v": kv_type,
             "n_threads": cpu_count,
             "n_batch": batch_size,
+            "n_ubatch": ubatch_size,
             "flash_attn": True,
             "use_mmap": True,
             "use_mlock": False,  # WSL2 doesn't support mlock well

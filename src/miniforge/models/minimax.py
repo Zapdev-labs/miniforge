@@ -71,6 +71,7 @@ class Miniforge:
         quantization: Optional[str] = None,
         config: Optional[M7Config] = None,
         backend: str = "llama_cpp",
+        cache_dir: Optional[str] = None,
     ) -> "Miniforge":
         """
         Load model from HuggingFace or cache.
@@ -80,10 +81,17 @@ class Miniforge:
             quantization: Quantization type (auto-selected if None)
             config: Configuration object
             backend: Backend to use
+            cache_dir: Directory to cache downloaded models
 
         Returns:
             Initialized Miniforge instance
         """
+        # Create or update config with cache_dir
+        if config is None:
+            config = load_config()
+        if cache_dir is not None:
+            config.cache_dir = cache_dir
+
         instance = cls(model_id, config, backend)
         await instance._load_model(quantization)
         return instance
@@ -138,41 +146,151 @@ class Miniforge:
                 from huggingface_hub import hf_hub_download
 
                 # Look for unsloth or other GGUF repos
-                repo_variants = [
-                    model_id.replace("MiniMaxAI/", "unsloth/"),
-                    model_id + "-GGUF",
-                ]
+                # If user already provided a unsloth GGUF repo, use it directly
+                if "unsloth" in model_id or "-GGUF" in model_id:
+                    repo_variants = [model_id]
+                else:
+                    repo_variants = [
+                        model_id.replace("MiniMaxAI/", "unsloth/"),
+                        model_id + "-GGUF",
+                    ]
 
-                gguf_file = None
+                gguf_files = []
                 for repo in repo_variants:
+                    logger.info(f"Trying repo: {repo}")
                     try:
-                        # Try common GGUF filenames
-                        for q in [quantization, "Q4_K_M", "Q5_K_M"]:
-                            try:
-                                filename = f"{model_id.split('/')[-1]}-{q}.gguf"
+                        # Try common GGUF filenames with different patterns
+                        # unsloth uses subdirectories like "2-bit/UD-IQ2_XXS/"
+                        base_name = model_id.split("/")[-1].replace("-GGUF", "")
 
-                                def _hub_dl() -> str:
-                                    return hf_hub_download(
-                                        repo_id=repo,
-                                        filename=filename,
-                                        local_dir=str(self._registry.gguf_dir),
-                                    )
+                        # Map quantization to bit-depth folder
+                        bit_depth_map = {
+                            "UD-IQ1_M": "1-bit",
+                            "UD-IQ2_XXS": "2-bit",
+                            "UD-IQ2_M": "2-bit",
+                            "UD-Q2_K_XL": "2-bit",
+                            "UD-IQ3_XXS": "3-bit",
+                            "UD-IQ3_S": "3-bit",
+                            "UD-IQ3_K_S": "3-bit",
+                            "UD-Q3_K_M": "3-bit",
+                            "UD-Q3_K_XL": "3-bit",
+                            "UD-IQ4_XS": "4-bit",
+                            "UD-Q4_K_S": "4-bit",
+                            "MXFP4_MOE": "4-bit",
+                            "UD-Q4_NL": "4-bit",
+                            "UD-Q4_K_M": "4-bit",
+                            "UD-Q4_K_XL": "4-bit",
+                            "UD-Q5_K_S": "5-bit",
+                            "UD-Q5_K_M": "5-bit",
+                            "UD-Q5_K_XL": "5-bit",
+                            "UD-Q6_K": "6-bit",
+                            "UD-Q6_K_XL": "6-bit",
+                            "Q8_0": "8-bit",
+                            "UD-Q8_K_XL": "8-bit",
+                            "BF16": "BF16",
+                        }
 
-                                gguf_file = await asyncio.get_event_loop().run_in_executor(
-                                    None,
-                                    _hub_dl,
-                                )
-                                break
-                            except Exception:
+                        for q in [quantization, "Q4_K_M"]:
+                            bit_depth = bit_depth_map.get(q, "")
+                            if not bit_depth:
                                 continue
-                        if gguf_file:
+
+                            # Try patterns for unsloth repo structure
+                            # Pattern: {bit-depth}/{quant}/MiniMax-M2.7-{quant}-00001-of-0000N.gguf
+                            search_patterns = [
+                                f"{bit_depth}/{q}/MiniMax-M2.7-{q}-00001-of-*.gguf",
+                                f"{bit_depth}/{q}/*.gguf",
+                                f"{q}/MiniMax-M2.7-{q}-00001-of-*.gguf",
+                                f"MiniMax-M2.7-{q}.gguf",
+                            ]
+
+                            for pattern in search_patterns:
+                                try:
+                                    from huggingface_hub import list_repo_files
+
+                                    files = list(list_repo_files(repo))
+                                    matching = [f for f in files if f.endswith(".gguf") and q in f]
+
+                                    if matching:
+                                        # Found files with this quantization
+                                        # Sort to get the first shard
+                                        matching.sort()
+                                        gguf_files = matching
+                                        logger.info(
+                                            f"Found {len(gguf_files)} GGUF files in {repo}: {gguf_files[:3]}..."
+                                        )
+                                        break
+                                except Exception as e:
+                                    logger.debug(f"    Pattern {pattern} failed: {e}")
+                                    continue
+
+                            if gguf_files:
+                                break
+                        if gguf_files:
                             break
-                    except Exception:
+                    except Exception as e:
+                        logger.warning(f"Repo {repo} failed: {e}")
                         continue
 
-                if gguf_file:
-                    model_path = Path(gguf_file)
+                if gguf_files:
+                    # Download the first GGUF file (or all if needed)
+                    # For now, download just the first one to check
+                    first_file = gguf_files[0]
+                    logger.info(f"Downloading {first_file}...")
+
+                    def _hub_dl(repo_id=repo, fname=first_file) -> str:
+                        return hf_hub_download(
+                            repo_id=repo_id,
+                            filename=fname,
+                            local_dir=str(self._registry.gguf_dir),
+                        )
+
+                    gguf_path = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        _hub_dl,
+                    )
+
+                    # If there are multiple shards, we need all of them
+                    if len(gguf_files) > 1:
+                        logger.info(f"Model has {len(gguf_files)} shards, downloading all...")
+                        for fname in gguf_files[1:]:
+
+                            def _hub_dl_shard(repo_id=repo, filename=fname) -> str:
+                                return hf_hub_download(
+                                    repo_id=repo_id,
+                                    filename=filename,
+                                    local_dir=str(self._registry.gguf_dir),
+                                )
+
+                            await asyncio.get_event_loop().run_in_executor(None, _hub_dl_shard)
+
+                    # llama.cpp can load split GGUF files with the first file
+                    model_path = Path(gguf_path)
                 else:
+                    # If user explicitly specified a GGUF repo but we couldn't find the file,
+                    # list available GGUF files to help the user
+                    if "unsloth" in model_id or "-GGUF" in model_id:
+                        available_files = []
+                        try:
+                            from huggingface_hub import list_repo_files
+
+                            for repo in repo_variants:
+                                try:
+                                    files = list(list_repo_files(repo))
+                                    available_files = [f for f in files if f.endswith(".gguf")]
+                                    if available_files:
+                                        break
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+
+                        msg = f"Could not find GGUF file for quantization '{quantization}' in {model_id}."
+                        if available_files:
+                            msg += f"\nAvailable GGUF files: {', '.join(available_files[:10])}"
+                        msg += f"\nCheck all files at: https://huggingface.co/{repo_variants[0]}/tree/main"
+                        raise ValueError(msg)
+
                     loop = asyncio.get_event_loop()
 
                     def _to_gguf() -> Path:
@@ -186,7 +304,12 @@ class Miniforge:
                     model_path = await loop.run_in_executor(None, _to_gguf)
 
             except Exception as e:
-                logger.warning(f"Could not get GGUF (download or convert): {e}")
+                logger.error(f"Could not get GGUF: {e}")
+                # If it's a GGUF-specific repo, don't fall back to transformers
+                if "unsloth" in model_id or "-GGUF" in model_id:
+                    raise RuntimeError(
+                        f"Failed to download GGUF from {model_id}. Error: {e}"
+                    ) from e
                 logger.info("Falling back to transformers backend")
                 self.backend_name = "transformers"
                 model_path = model_id

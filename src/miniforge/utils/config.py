@@ -27,23 +27,32 @@ class M7Config:
     reserve_memory_gb: float = 4.0
 
     # CPU settings
-    n_threads: int = 8  # Physical cores
-    n_batch: int = 512
+    n_threads: int = 8  # Physical cores - Ryzen 7 PRO 6850H
+    n_batch: int = 2048  # Increased for better throughput with 192K context
+    n_ubatch: int = 512  # Micro-batch size for processing
 
     # Model settings
     model_id: str = DEFAULT_MODEL_ID
     model_weights_path: Optional[str] = None
-    n_ctx: int = 200_000
+    n_ctx: int = 194_560  # Full 192K context minus safety headroom (196608 - 2048)
     quantization: str = "Q4_K_M"
 
     # KV cache compression (TurboQuant)
     cache_type_k: str = "turbo3"  # 3-bit compression
     cache_type_v: str = "turbo3"
 
+    # GPU offloading (for AMD Radeon 680M iGPU)
+    n_gpu_layers: int = 0  # Set to 15-20 to offload some layers to 4GB VRAM
+    main_gpu: int = 0  # Primary GPU device
+    tensor_split: Optional[list[float]] = None  # For multi-GPU setups
+
     # Performance features
     flash_attn: bool = True
     use_mmap: bool = True
     use_mlock: bool = False  # WSL2 doesn't support mlock
+    rope_scaling_type: Optional[str] = "linear"  # For long context scaling
+    rope_freq_base: float = 10000.0  # Default RoPE base frequency
+    rope_freq_scale: float = 1.0  # RoPE scaling factor (1.0 = no scaling)
 
     # Backend selection
     backend: str = "llama_cpp"  # llama_cpp or transformers
@@ -72,7 +81,18 @@ class M7Config:
         if self.n_ctx < 512:
             logger.warning(f"Context window {self.n_ctx} very small, minimum 512 recommended")
 
-        valid_quants = ["Q2_K", "Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "F16"]
+        valid_quants = [
+            "Q2_K",
+            "Q3_K_M",
+            "Q4_K_M",
+            "Q5_K_M",
+            "Q6_K",
+            "Q8_0",
+            "F16",
+            "UD-IQ2_XXS",
+            "UD-IQ2_M",
+            "UD-Q2_K_XL",
+        ]
         if self.quantization not in valid_quants:
             logger.warning(f"Unknown quantization {self.quantization}, using Q4_K_M")
             self.quantization = "Q4_K_M"
@@ -117,17 +137,27 @@ class M7Config:
 
     def get_backend_config(self) -> Dict[str, Any]:
         """Get backend-specific configuration."""
-        return {
+        config = {
             "n_ctx": self.n_ctx,
             "n_threads": self.n_threads,
             "n_batch": self.n_batch,
+            "n_ubatch": self.n_ubatch,
             "cache_type_k": self.cache_type_k,
             "cache_type_v": self.cache_type_v,
             "flash_attn": self.flash_attn,
             "use_mmap": self.use_mmap,
             "use_mlock": self.use_mlock,
             "verbose": self.verbose,
+            "n_gpu_layers": self.n_gpu_layers,
+            "main_gpu": self.main_gpu,
         }
+        if self.tensor_split is not None:
+            config["tensor_split"] = self.tensor_split
+        if self.rope_scaling_type is not None:
+            config["rope_scaling_type"] = self.rope_scaling_type
+        config["rope_freq_base"] = self.rope_freq_base
+        config["rope_freq_scale"] = self.rope_freq_scale
+        return config
 
     def get_generation_defaults(self) -> Dict[str, Any]:
         """Get default generation parameters."""

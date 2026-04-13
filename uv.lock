@@ -930,6 +930,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "huggingface-hub" },
+    { name = "llama-cpp-python" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pillow" },
@@ -986,6 +987,7 @@ requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=24.0" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.110.0" },
     { name = "huggingface-hub", specifier = ">=0.20" },
+    { name = "llama-cpp-python", specifier = ">=0.3.20" },
     { name = "llama-cpp-python", marker = "extra == 'llama-cpp'", specifier = ">=0.3.5" },
     { name = "miniforge", extras = ["server", "dev"], marker = "extra == 'all'" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8" },
