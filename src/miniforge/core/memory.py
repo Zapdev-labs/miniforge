@@ -1,4 +1,8 @@
-"""Memory management for GMKtech M7 28GB constraint."""
+"""Memory management for GMKtech M7 28GB constraint.
+
+AirLLM-inspired: dynamically probe available RAM and size context/cache
+to fit, rather than relying on static defaults that cause swap thrashing.
+"""
 
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
@@ -209,6 +213,97 @@ class MemoryManager:
 
         self.current_kv_memory = kv_gb
         logger.info(f"Registered KV cache: {context_tokens} tokens = {kv_gb:.2f}GB")
+
+    def compute_moe_context(
+        self,
+        model_disk_gb: float,
+        n_layers: int = 62,
+        n_kv_heads: int = 8,
+        head_dim: int = 128,
+        kv_cache_type: str = "q8_0",
+        is_moe: bool = True,
+    ) -> int:
+        """
+        AirLLM-inspired: compute the largest context window that fits in RAM.
+
+        For MoE models, the weights live on disk via mmap. Only a fraction
+        (active experts + routing tables) is resident at any time.  The KV
+        cache, however, must be fully resident.  So the formula is:
+
+            available_for_kv = physical_RAM - OS_reserve - mmap_resident_estimate
+            max_ctx = available_for_kv / kv_bytes_per_token
+
+        Args:
+            model_disk_gb: Total GGUF size on disk (e.g. 61 for IQ2_XXS).
+            n_layers: Number of transformer layers.
+            n_kv_heads: Number of KV attention heads.
+            head_dim: Dimension per head.
+            kv_cache_type: Cache quantization (q4_0, q8_0, f16).
+            is_moe: Whether this is a Mixture-of-Experts model.
+
+        Returns:
+            Recommended n_ctx that fits in RAM without swap thrashing.
+        """
+        mem = psutil.virtual_memory()
+        total_gb = mem.total / (1024**3)
+        available_gb = mem.available / (1024**3)
+
+        # Reserve for OS + other processes
+        os_reserve_gb = max(4.0, total_gb * 0.15)
+
+        if is_moe:
+            # MoE models: only ~5-15% of weights are resident via mmap at any time
+            # (active experts + routing tables + embeddings).
+            # On 28GB with 61GB model: ~3-6GB resident, rest paged from SSD.
+            mmap_resident_gb = min(model_disk_gb * 0.10, total_gb * 0.25)
+        else:
+            # Dense models: most weights will be resident
+            mmap_resident_gb = min(model_disk_gb, total_gb * 0.7)
+
+        # Working memory for compute buffers
+        working_gb = 1.0
+
+        budget_gb = total_gb - os_reserve_gb - mmap_resident_gb - working_gb
+        budget_gb = max(budget_gb, 0.5)  # Floor
+
+        # KV cache bytes per token: 2 * n_layers * n_kv_heads * head_dim * dtype_bytes
+        dtype_bytes = {
+            "f16": 2.0,
+            "q8_0": 1.0,
+            "q4_0": 0.5,
+            "q4_1": 0.5625,
+        }
+        bpt = dtype_bytes.get(kv_cache_type, 1.0)
+        kv_bytes_per_token = 2 * n_layers * n_kv_heads * head_dim * bpt
+
+        max_tokens = int((budget_gb * 1024**3) / kv_bytes_per_token)
+
+        # Snap to standard sizes
+        standard_sizes = [
+            1024, 2048, 4096, 8192, 16384, 32768,
+            65536, 131072, 194_560,
+        ]
+        best_ctx = 2048  # minimum useful size
+        for size in standard_sizes:
+            if size <= max_tokens:
+                best_ctx = size
+            else:
+                break
+
+        logger.info(
+            "AirLLM context sizing: RAM=%.1fGB, budget=%.1fGB (os=%.1f, mmap_resident=%.1f, "
+            "working=%.1f), kv_per_token=%dB, max_tokens=%d -> n_ctx=%d",
+            total_gb,
+            budget_gb,
+            os_reserve_gb,
+            mmap_resident_gb,
+            working_gb,
+            int(kv_bytes_per_token),
+            max_tokens,
+            best_ctx,
+        )
+
+        return best_ctx
 
     def get_optimal_settings(self, model_params_billions: float) -> Dict[str, Any]:
         """

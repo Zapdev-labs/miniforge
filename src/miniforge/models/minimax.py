@@ -72,6 +72,7 @@ class Miniforge:
         config: Optional[M7Config] = None,
         backend: str = "llama_cpp",
         cache_dir: Optional[str] = None,
+        download_dir: Optional[str] = None,
     ) -> "Miniforge":
         """
         Load model from HuggingFace or cache.
@@ -82,18 +83,25 @@ class Miniforge:
             config: Configuration object
             backend: Backend to use
             cache_dir: Directory to cache downloaded models
+            download_dir: Directory where GGUF shards are stored/downloaded (e.g. "D:/AI").
+                          Takes precedence over cache_dir for GGUF storage.
 
         Returns:
             Initialized Miniforge instance
         """
-        # Create or update config with cache_dir
+        # Create or update config with cache_dir / download_dir
         if config is None:
             config = load_config()
         if cache_dir is not None:
             config.cache_dir = cache_dir
+        # download_dir overrides where GGUF files land (e.g. "D:/AI" for large models)
+        if download_dir is not None:
+            config.download_dir = download_dir
+        elif config.download_dir:
+            download_dir = config.download_dir
 
         instance = cls(model_id, config, backend)
-        await instance._load_model(quantization)
+        await instance._load_model(quantization, download_dir=download_dir)
         return instance
 
     @classmethod
@@ -114,15 +122,123 @@ class Miniforge:
         """
         return cls(gguf_path, config, "llama_cpp")
 
-    async def _load_model(self, quantization: Optional[str] = None) -> None:
+    async def _load_model(
+        self, quantization: Optional[str] = None, download_dir: Optional[str] = None
+    ) -> None:
         """Load and prepare model."""
         model_id = str(self.model_path)
+
+        # Resolve download directory: explicit arg > config field > registry gguf_dir default
+        gguf_download_dir = (
+            Path(download_dir).expanduser()
+            if download_dir
+            else self._registry.gguf_dir
+        )
+        gguf_download_dir.mkdir(parents=True, exist_ok=True)
 
         # Get model info
         model_info = self._registry.get_model_info(model_id)
 
+        # Model architecture mapping: model_id -> n_layers
+        MODEL_ARCHITECTURE = {
+            # MiniMax M2 series: 62 layers
+            "MiniMax-M2": 62,
+            "MiniMax-M2.1": 62,
+            "MiniMax-M2.5": 62,
+            "MiniMax-M2.7": 62,
+            # MiniMax 01 series (Text-01, VL-01, M1): 80 layers
+            "MiniMax-Text-01": 80,
+            "MiniMax-VL-01": 80,
+            "MiniMax-M1": 80,
+            # Llama 4 series: typically 48-80 layers depending on variant
+            "Llama-4-Scout": 48,
+            "Llama-4-Maverick": 80,
+            "Llama-3": 80,  # 3.1, 3.2, 3.3 all use similar architecture
+            # Mistral: varies by model
+            "Mistral-Small-3.1": 40,
+            "Mistral-Large-2": 80,
+            "Mistral-Nemo": 40,
+            # Qwen: varies by size
+            "Qwen3-235B": 80,
+            "Qwen3-32B": 64,
+            "Qwen3-14B": 48,
+            "Qwen3-8B": 36,
+            "Qwen3-4B": 32,
+            "Qwen3-1.7B": 24,
+            "Qwen3-0.6B": 24,
+            "QwQ-32B": 64,
+            "Qwen2.5-VL": 64,
+            "Qwen2.5-Coder": 64,
+            # Kimi K2.5
+            "Kimi-K2.5": 64,
+        }
+
+        def get_n_layers(model_id: str) -> int:
+            """Get number of layers for a model, with fallback to 62."""
+            model_id_lower = model_id.lower()
+            for key, layers in MODEL_ARCHITECTURE.items():
+                if key.lower() in model_id_lower:
+                    return layers
+            return 62  # Default fallback
+
         if model_info:
             params = model_info.params_billions
+            # Propagate per-model metadata to config
+            if model_info.max_context:
+                self.config.max_model_ctx = model_info.max_context
+            if model_info.is_moe:
+                self.config.is_moe = True
+                # AirLLM-inspired: dynamically compute safe context from available RAM
+                # instead of a hardcoded 8192 that may waste memory or still be too large.
+                kv_type = self.config.cache_type_k
+                # If turbo3/turbo4 will fall back to q8_0, plan for that
+                if kv_type in ("turbo3", "turbo4"):
+                    effective_kv_type = "q4_0"
+                else:
+                    effective_kv_type = kv_type
+
+                # Estimate GGUF disk size from param count + quant ratio
+                quant_bpw = {
+                    "UD-TQ1_0": 1.0, "UD-IQ1_S": 1.1, "UD-IQ1_M": 1.2,
+                    "UD-IQ2_XXS": 2.06, "UD-IQ2_M": 2.3, "Q2_K": 2.5,
+                    "UD-IQ3_XXS": 3.0, "Q3_K_M": 3.4,
+                    "Q4_K_M": 4.5, "Q5_K_M": 5.5, "Q6_K": 6.5, "Q8_0": 8.0,
+                }
+                bpw = quant_bpw.get(quantization or self.config.quantization, 2.5)
+                disk_gb = (params * 1e9 * bpw) / (8 * 1024**3)
+
+                # Get appropriate n_layers for this model architecture
+                n_layers = get_n_layers(model_id)
+
+                safe_ctx = self._memory_manager.compute_moe_context(
+                    model_disk_gb=disk_gb,
+                    n_layers=n_layers,
+                    n_kv_heads=8,
+                    head_dim=128,
+                    kv_cache_type=effective_kv_type,
+                    is_moe=True,
+                )
+
+                if self.config.n_ctx > safe_ctx:
+                    logger.warning(
+                        "MoE model %s: reducing n_ctx %s -> %s to fit KV cache in RAM. "
+                        "Override with config=M7Config(n_ctx=N).",
+                        model_id,
+                        self.config.n_ctx,
+                        safe_ctx,
+                    )
+                    self.config.n_ctx = safe_ctx
+            # Warn when the model is far larger than available RAM
+            if params > 100:
+                min_gb = params * 2 * 0.083  # UD-TQ1_0 ≈ 8.3% of fp16 size
+                logger.warning(
+                    "%.0fB-parameter MoE model. Smallest GGUF ≈ %.0f GB (UD-TQ1_0). "
+                    "Requires %.0f GB free NVMe disk. "
+                    "llama.cpp will mmap experts from disk — inference speed depends on SSD bandwidth.",
+                    params,
+                    min_gb,
+                    min_gb,
+                )
         else:
             # Assume 2.7B for MiniMax
             params = 2.7
@@ -156,24 +272,29 @@ class Miniforge:
                     ]
 
                 gguf_files = []
+                found_in_repo = repo_variants[0]  # track which repo had the files
                 for repo in repo_variants:
                     logger.info(f"Trying repo: {repo}")
                     try:
-                        # Try common GGUF filenames with different patterns
-                        # unsloth uses subdirectories like "2-bit/UD-IQ2_XXS/"
-                        base_name = model_id.split("/")[-1].replace("-GGUF", "")
+                        from huggingface_hub import list_repo_files
 
-                        # Map quantization to bit-depth folder
+                        # Map quantization to bit-depth folder (unsloth subdirectory layout)
                         bit_depth_map = {
+                            "UD-TQ1_0": "1-bit",
+                            "UD-IQ1_S": "1-bit",
                             "UD-IQ1_M": "1-bit",
                             "UD-IQ2_XXS": "2-bit",
                             "UD-IQ2_M": "2-bit",
                             "UD-Q2_K_XL": "2-bit",
+                            "Q2_K": "2-bit",
                             "UD-IQ3_XXS": "3-bit",
                             "UD-IQ3_S": "3-bit",
                             "UD-IQ3_K_S": "3-bit",
                             "UD-Q3_K_M": "3-bit",
                             "UD-Q3_K_XL": "3-bit",
+                            "Q3_K": "3-bit",
+                            "Q3_K_S": "3-bit",
+                            "Q3_K_M": "3-bit",
                             "UD-IQ4_XS": "4-bit",
                             "UD-Q4_K_S": "4-bit",
                             "MXFP4_MOE": "4-bit",
@@ -190,42 +311,66 @@ class Miniforge:
                             "BF16": "BF16",
                         }
 
-                        for q in [quantization, "Q4_K_M"]:
+                        # Phase 1: try unsloth subdirectory layout ({bit-depth}/{quant}/*.gguf)
+                        for q in [quantization, "UD-Q4_K_M", "Q4_K_M"]:
                             bit_depth = bit_depth_map.get(q, "")
                             if not bit_depth:
                                 continue
-
-                            # Try patterns for unsloth repo structure
-                            # Pattern: {bit-depth}/{quant}/MiniMax-M2.7-{quant}-00001-of-0000N.gguf
-                            search_patterns = [
-                                f"{bit_depth}/{q}/MiniMax-M2.7-{q}-00001-of-*.gguf",
-                                f"{bit_depth}/{q}/*.gguf",
-                                f"{q}/MiniMax-M2.7-{q}-00001-of-*.gguf",
-                                f"MiniMax-M2.7-{q}.gguf",
-                            ]
-
-                            for pattern in search_patterns:
-                                try:
-                                    from huggingface_hub import list_repo_files
-
-                                    files = list(list_repo_files(repo))
-                                    matching = [f for f in files if f.endswith(".gguf") and q in f]
-
-                                    if matching:
-                                        # Found files with this quantization
-                                        # Sort to get the first shard
-                                        matching.sort()
-                                        gguf_files = matching
-                                        logger.info(
-                                            f"Found {len(gguf_files)} GGUF files in {repo}: {gguf_files[:3]}..."
-                                        )
-                                        break
-                                except Exception as e:
-                                    logger.debug(f"    Pattern {pattern} failed: {e}")
-                                    continue
-
+                            try:
+                                files = list(list_repo_files(repo))
+                                matching = sorted(
+                                    f for f in files if f.endswith(".gguf") and q in f
+                                )
+                                if matching:
+                                    gguf_files = matching
+                                    found_in_repo = repo
+                                    logger.info(
+                                        "Found %d GGUF files in %s (quant=%s, subdirectory layout): %s...",
+                                        len(gguf_files),
+                                        repo,
+                                        q,
+                                        gguf_files[:3],
+                                    )
+                                    break
+                            except Exception as e:
+                                logger.debug("Subdirectory scan failed for %s/%s: %s", repo, q, e)
                             if gguf_files:
                                 break
+
+                        # Phase 2: flat-structure fallback (e.g. bakosh/*, bartowski/*)
+                        # These repos place .gguf files directly in the root with no subdirectories.
+                        if not gguf_files:
+                            try:
+                                all_files = list(list_repo_files(repo))
+                                # Try requested quant first, then common fallbacks
+                                for q_try in [
+                                    quantization,
+                                    "UD-TQ1_0",
+                                    "Q2_K",
+                                    "Q3_K_M",
+                                    "Q4_K_M",
+                                ]:
+                                    if not q_try:
+                                        continue
+                                    matching = sorted(
+                                        f
+                                        for f in all_files
+                                        if f.endswith(".gguf") and q_try in f
+                                    )
+                                    if matching:
+                                        gguf_files = matching
+                                        found_in_repo = repo
+                                        logger.info(
+                                            "Found %d GGUF files in %s via flat scan (quant=%s): %s...",
+                                            len(gguf_files),
+                                            repo,
+                                            q_try,
+                                            gguf_files[:3],
+                                        )
+                                        break
+                            except Exception as e:
+                                logger.debug("Flat repo scan failed for %s: %s", repo, e)
+
                         if gguf_files:
                             break
                     except Exception as e:
@@ -233,16 +378,19 @@ class Miniforge:
                         continue
 
                 if gguf_files:
-                    # Download the first GGUF file (or all if needed)
-                    # For now, download just the first one to check
                     first_file = gguf_files[0]
-                    logger.info(f"Downloading {first_file}...")
+                    logger.info(
+                        "Downloading %s from %s to %s...",
+                        first_file,
+                        found_in_repo,
+                        gguf_download_dir,
+                    )
 
-                    def _hub_dl(repo_id=repo, fname=first_file) -> str:
+                    def _hub_dl(repo_id=found_in_repo, fname=first_file) -> str:
                         return hf_hub_download(
                             repo_id=repo_id,
                             filename=fname,
-                            local_dir=str(self._registry.gguf_dir),
+                            local_dir=str(gguf_download_dir),
                         )
 
                     gguf_path = await asyncio.get_event_loop().run_in_executor(
@@ -250,16 +398,21 @@ class Miniforge:
                         _hub_dl,
                     )
 
-                    # If there are multiple shards, we need all of them
+                    # Multi-shard models (e.g. Kimi K2.5 Q2_K = 41 shards): download all.
+                    # llama.cpp loads split GGUFs by pointing to the first shard.
                     if len(gguf_files) > 1:
-                        logger.info(f"Model has {len(gguf_files)} shards, downloading all...")
+                        logger.info(
+                            "Multi-shard model: downloading remaining %d shards to %s...",
+                            len(gguf_files) - 1,
+                            gguf_download_dir,
+                        )
                         for fname in gguf_files[1:]:
 
-                            def _hub_dl_shard(repo_id=repo, filename=fname) -> str:
+                            def _hub_dl_shard(repo_id=found_in_repo, filename=fname) -> str:
                                 return hf_hub_download(
                                     repo_id=repo_id,
                                     filename=filename,
-                                    local_dir=str(self._registry.gguf_dir),
+                                    local_dir=str(gguf_download_dir),
                                 )
 
                             await asyncio.get_event_loop().run_in_executor(None, _hub_dl_shard)

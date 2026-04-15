@@ -1,36 +1,46 @@
 # Miniforge Agent Guide
 
-## Mission
-- Keep Miniforge reliable for local MiniMax inference on constrained hardware.
-- Prefer small, focused edits that preserve public behavior unless a change request says otherwise.
+## Purpose
+Python library for MiniMax M2.7 inference, optimized for GMKtech M7 (28GB RAM constraint).
 
-## Repo Facts
-- Language: Python (`>=3.10`).
-- Packaging: `pyproject.toml` with `hatchling`.
-- Source root: `src/miniforge`.
-- Tests: `tests/` using `pytest`.
-- Typical runtime target: local CPU inference, memory-constrained systems.
+## Architecture
+- Source: `src/miniforge/` — import as `miniforge`
+- Public API: `Miniforge`, `InferenceEngine`, `M7Config` (from `__init__.py`)
+- Backends: `llama_cpp` (preferred) with `transformers` fallback
+- Config: `M7Config` + YAML files in `configs/`
 
-## Working Rules
-- Do not start development servers unless explicitly requested.
-- Run builds/checks/tests instead of long-running dev commands.
-- Avoid creating new markdown files unless requested; update existing docs when needed.
-- Never hardcode secrets or API keys; use environment variables/config files.
-- Keep comments minimal and only where logic is genuinely non-obvious.
+## Development Commands
+```bash
+# Install (uv preferred; editable avoids llama-cpp-python build issues on Windows)
+uv pip install -e ".[all]"
 
-## Code Style Expectations
-- Follow existing style and structure in nearby files.
-- Preserve strict typing and avoid introducing untyped public APIs.
-- Keep imports at the top of files.
-- Make behavior-preserving refactors unless user asks for feature changes.
+# For llama.cpp backend only (requires C++ toolchain on Windows)
+uv pip install -e ".[llama-cpp]"
 
-## Validation Before Handoff
-- Run targeted tests first, then broader suite if change scope grows:
-  - `pytest tests/test_core.py`
-  - `pytest tests/test_tools.py`
-  - `pytest`
-- If config or packaging changes are made, also run:
-  - `python -m pip install -e .`
+# Validation order
+black src/ tests/
+ruff check src/ tests/
+mypy src/
+pytest tests/test_core.py   # quick check
+pytest tests/test_tools.py  # tool calling
+pytest                      # full suite (slow)
 
-## Directory-Level Overrides
-- If a subdirectory contains its own `AGENTS.md`, follow the closest one first.
+# Reinstall after packaging changes
+python -m pip install -e .
+```
+
+## Tooling Config (from pyproject.toml)
+- **Black**: line-length 100, target py310-312
+- **Ruff**: same line-length, ignores E501 (handled by black), B008, C901, N818
+- **MyPy**: strict — `disallow_untyped_defs = true`, `disallow_incomplete_defs = true`
+- **Pytest**: asyncio_mode = auto, addopts `-v --tb=short`
+
+## Conventions
+- All public APIs must be typed (mypy strict).
+- Keep async; no blocking calls in async paths.
+- Memory defaults are conservative (28GB ceiling).
+- Backend errors must be clear when fallback unavailable.
+- Never hardcode secrets; use env vars.
+
+## Directory Override
+- `src/` has additional rules in `src/AGENTS.md`.
