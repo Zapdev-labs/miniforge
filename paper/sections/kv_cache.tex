@@ -194,21 +194,24 @@ This enables infinite context length with bounded memory, trading completeness f
 
 \subsection{Measurement and Monitoring}
 
-Miniforge provides KV cache monitoring:
+Miniforge provides comprehensive KV cache monitoring through the memory management interface:
 
-\begin{lstlisting}[language=Python, caption=KV Cache Monitoring]
-# Register cache allocation
-memory_manager.register_kv_memory(
-    context_tokens=194560,
-    kv_type="turbo3"
-)
+\textbf{Cache Registration:}
+\begin{itemize}
+    \item Cache allocations are tracked at initialization time
+    \item Context length and compression type recorded
+    \item Memory reserved and protected from overallocation
+\end{itemize}
 
-# Get cache statistics
-stats = model.get_memory_stats()
-print(f"KV Cache: {stats.kv_cache_gb:.2f} GB")
-print(f"Model: {stats.model_memory_gb:.2f} GB")
-print(f"Available: {stats.available_gb:.2f} GB")
-\end{lstlisting}
+\textbf{Statistics Collection:}
+\begin{itemize}
+    \item KV cache allocation size (GB)
+    \item Model weights allocation (GB)
+    \item Available system memory (GB)
+    \item Utilization percentage
+\end{itemize}
+
+These metrics enable real-time monitoring and debugging of memory consumption during inference operations.
 
 \subsection{Performance Characteristics}
 

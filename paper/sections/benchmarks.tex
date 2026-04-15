@@ -175,19 +175,25 @@ Tests consistency in long-form generation:
 
 \subsubsection{Automated Test Runner}
 
-\begin{lstlisting}[language=Python, caption=Benchmark Runner]
-class BenchmarkRunner:
-    async def run_benchmarks(self) -> BenchmarkReport:
-        report = BenchmarkReport(timestamp=time.time())
-        
-        for name in self.select_benchmarks:
-            print(f"Running: {name}")
-            results = await self.BENCHMARK_MODULES[name]["runner"](self.model)
-            report.results[name] = results
-        
-        report.summary = self._generate_summary(report.results)
-        return report
-\end{lstlisting}
+The benchmark runner orchestrates test execution and result aggregation:
+
+\textbf{Runner Workflow:}
+\begin{enumerate}
+    \item Initialize benchmark report with timestamp
+    \item Iterate through selected benchmark modules
+    \item Execute each runner with the target model
+    \item Collect results and store in report
+    \item Generate statistical summary
+    \item Return complete benchmark report
+\end{enumerate}
+
+\textbf{Report Contents:}
+\begin{itemize}
+    \item Timestamp and system configuration
+    \item Individual benchmark results with raw data
+    \item Statistical summaries (mean, std dev, percentiles)
+    \item Pass/fail indicators against targets
+\end{itemize}
 
 \subsubsection{Result Storage}
 

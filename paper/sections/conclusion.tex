@@ -3,17 +3,19 @@
 
 \subsection{Summary}
 
-This paper presented Miniforge, a high-performance inference engine enabling deployment of the MiniMax M2.7 model on the GMKtech M7 platform with 28GB RAM. Through systematic optimization of quantization, KV cache compression, and hardware-specific tuning, Miniforge achieves:
+This paper presented Miniforge, a high-performance inference engine enabling deployment of the MiniMax M2.7 model on the GMKtech M7 platform with 28GB RAM. Through systematic optimization of quantization, KV cache compression, and hardware-specific tuning, Miniforge achieves performance metrics that exceed targets while maintaining practical quality levels.
+
+Specifically, our implementation demonstrates:
 
 \begin{itemize}
-    \item \textbf{19.8 tokens/second} generation throughput, exceeding the 10 tok/s target for interactive applications
-    \item \textbf{6.3GB total memory footprint}, leaving substantial headroom within the 24GB budget
-    \item \textbf{Full 192K context window} support with 94.3\% retrieval accuracy
-    \item \textbf{87.3\% quality retention} compared to FP16 baseline
-    \item \textbf{89ms TTFT}, enabling responsive interactive experiences
+    \item \textbf{19.8 tokens/second} generation throughput, nearly doubling the 10 tok/s target for interactive applications and providing headroom for demanding use cases
+    \item \textbf{6.3GB total memory footprint}, utilizing only 26\% of the available 24GB budget and leaving substantial headroom for concurrent operations
+    \item \textbf{Full 192K context window} support with 94.3\% needle-in-haystack retrieval accuracy, enabling practical long-document processing
+    \item \textbf{87.3\% quality retention} compared to FP16 baseline, maintaining model capabilities within acceptable bounds for production deployment
+    \item \textbf{89ms TTFT} (Time to First Token), enabling responsive interactive experiences with perceptually instantaneous response initiation
 \end{itemize}
 
-All target criteria were achieved, with several stretch goals exceeded.
+All target criteria from Table \ref{tab:target_criteria} were achieved, with several stretch goals exceeded. The combination of strong performance and modest resource requirements validates our approach of hardware-specific optimization for constrained deployment scenarios.
 
 \subsection{Key Contributions}
 

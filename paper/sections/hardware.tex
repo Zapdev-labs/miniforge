@@ -72,29 +72,31 @@ The cache hierarchy significantly impacts inference performance:
 
 \subsection{Platform-Specific Configuration}
 
-The M7Config class encapsulates hardware-specific optimizations:
+The M7Config class encapsulates hardware-specific optimizations for the GMKtech M7 platform:
 
-\begin{lstlisting}[language=Python, caption=M7Config Hardware-Specific Settings]
-@dataclass
-class M7Config:
-    # CPU settings optimized for Ryzen 7 PRO 6850H
-    n_threads: int = 8  # Physical cores
-    n_batch: int = 2048  # Tuned for DDR5 bandwidth
-    n_ubatch: int = 512  # L2 cache friendly
-    
-    # Memory limits
-    max_memory_gb: float = 24.0
-    reserve_memory_gb: float = 4.0
-    
-    # TurboQuant for memory efficiency
-    cache_type_k: str = "turbo3"
-    cache_type_v: str = "turbo3"
-    
-    # AMD-specific optimizations
-    flash_attn: bool = True
-    use_mmap: bool = True
-    use_mlock: bool = False  # WSL2 limitation
-\end{lstlisting}
+\begin{table}[h]
+\centering
+\caption{M7Config Hardware-Specific Settings}
+\label{tab:m7config_settings}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Rationale} \\
+\midrule
+n\_threads & 8 & Physical core count (no hyperthreading) \\
+n\_batch & 2048 & Tuned for DDR5 bandwidth \\
+n\_ubatch & 512 & L2 cache-friendly micro-batch \\
+max\_memory\_gb & 24.0 & Available after iGPU allocation \\
+reserve\_memory\_gb & 4.0 & OS and system overhead \\
+cache\_type\_k & turbo3 & Key cache compression \\
+cache\_type\_v & turbo3 & Value cache compression \\
+flash\_attn & True & AMD-optimized attention \\
+use\_mmap & True & Demand paging for weights \\
+use\_mlock & False & WSL2 limitation (not supported) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These defaults are derived from extensive profiling on the target hardware, balancing throughput, latency, and memory efficiency.
 
 \subsection{WSL2 Considerations}
 

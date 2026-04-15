@@ -92,7 +92,7 @@ Miniforge's MemoryManager draws inspiration from these approaches, adapted for C
 
 \subsection{Comparison with Concurrent Work}
 
-Table \ref{tab:related_comparison} compares Miniforge with related systems.
+Table \ref{tab:related_comparison} compares Miniforge with related systems across key deployment characteristics. Each system occupies a distinct position in the design space, reflecting different optimization targets and use cases.
 
 \begin{table}[h]
 \centering
@@ -109,6 +109,14 @@ Miniforge & CPU (28GB) & 192K & 20 tok/s & Constrained \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\textbf{llama.cpp} serves as Miniforge's primary backend and provides general-purpose CPU/GPU inference. While highly capable, llama.cpp does not implement hardware-specific optimizations for 28GB-class systems or automatic memory management tailored to constrained deployments. Miniforge adds these capabilities while maintaining compatibility with llama.cpp's extensive quantization support.
+
+\textbf{vLLM} focuses on GPU-based serving with sophisticated memory management through PagedAttention. Its optimizations target datacenter deployment with abundant VRAM, making it unsuitable for our target platform. However, vLLM's memory management concepts influenced our MemoryManager design.
+
+\textbf{Ollama} provides convenient local LLM deployment primarily for macOS systems. Its focus on ease of use for desktop users complements Miniforge's focus on constrained hardware optimization. The two projects address different segments of the local deployment market.
+
+Miniforge's distinctive contribution is demonstrating that careful hardware-specific optimization enables capable LLM deployment on resource-constrained platforms previously considered inadequate for practical use.
 
 \subsection{Research Gaps Addressed}
 

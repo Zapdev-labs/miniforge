@@ -246,7 +246,9 @@ We describe our specific benchmark implementations in Section \ref{sec:benchmark
 
 \subsection{The Efficiency-Quality Trade-off}
 
-The central challenge in deploying LLMs on constrained hardware is navigating the efficiency-quality Pareto frontier. Figure \ref{fig:pareto} illustrates this trade-off conceptually.
+The central challenge in deploying LLMs on constrained hardware is navigating the efficiency-quality Pareto frontier. This trade-off is inherent in model compression: increased compression yields reduced resource consumption but potentially degrades model capabilities. Understanding and characterizing this frontier is essential for making informed deployment decisions.
+
+Figure \ref{fig:pareto} illustrates this trade-off conceptually, plotting memory consumption against quality score for different quantization levels.
 
 \begin{figure}[h]
 \centering
@@ -276,4 +278,15 @@ The central challenge in deploying LLMs on constrained hardware is navigating th
 \label{fig:pareto}
 \end{figure}
 
-Miniforge targets the feasible region defined by our 24GB memory constraint while maximizing quality, specifically selecting Q4\_K\_M as the primary quantization level based on its position on the Pareto frontier.
+The Pareto frontier represents optimal trade-offs where improving one metric (memory or quality) necessarily worsens the other. Points below and to the right of this curve are suboptimal---better configurations exist that achieve both lower memory and higher quality.
+
+\textbf{Configuration Selection:} Miniforge targets the feasible region defined by our 24GB memory constraint while maximizing quality. Based on empirical evaluation, Q4\_K\_M occupies an attractive position on the Pareto frontier:
+\begin{itemize}
+    \item It achieves 4x compression (1.35 GB vs 5.4 GB for weights)
+    \item Quality retention of 94\% exceeds our 85\% minimum threshold
+    \item It leaves substantial headroom for the KV cache within our memory budget
+\end{itemize}
+
+More aggressive quantization (Q3\_K\_M, Q2\_K) falls on the frontier but with quality below acceptable thresholds for production deployment. Less aggressive quantization (Q6\_K, Q8\_0) provides diminishing quality returns for significantly increased memory consumption.
+
+\textbf{Task-Dependent Considerations:} The efficiency-quality trade-off varies by task. Tasks requiring precise factual recall (question answering) may be more sensitive to quantization than creative generation tasks. Miniforge addresses this through comprehensive benchmarking across diverse task types rather than single-metric evaluation.

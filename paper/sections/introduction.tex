@@ -3,9 +3,21 @@
 
 \subsection{The Challenge of Local LLM Deployment}
 
-The emergence of Large Language Models (LLMs) has fundamentally transformed the landscape of artificial intelligence and natural language processing. Models like GPT-4, Claude, and Llama have demonstrated remarkable capabilities across a wide range of tasks, from creative writing to code generation, mathematical reasoning to multimodal understanding. However, these capabilities come at a significant computational cost: state-of-the-art models often require tens or hundreds of gigabytes of GPU memory, specialized hardware accelerators, and substantial power consumption.
+The emergence of Large Language Models (LLMs) has fundamentally transformed the landscape of artificial intelligence and natural language processing over the past decade. Beginning with the Transformer architecture introduced by Vaswani et al. in 2017 \cite{vaswani2017attention}, the field has witnessed exponential growth in model capabilities, driven by increases in parameter count, training data, and computational resources. Models like GPT-4, Claude, Llama, and their successors have demonstrated remarkable capabilities across a wide range of tasks, from creative writing to code generation, mathematical reasoning to multimodal understanding.
 
-This resource intensity creates a fundamental tension in the deployment of LLMs. While cloud-based APIs provide convenient access to powerful models, they introduce concerns about data privacy, latency, cost, and vendor lock-in. Local deployment offers an alternative but is often perceived as requiring expensive hardware investments beyond the reach of individual researchers, small teams, or hobbyist developers.
+However, these capabilities come at a significant computational cost. State-of-the-art models often require tens or hundreds of gigabytes of GPU memory, specialized hardware accelerators, and substantial power consumption. For instance, deploying GPT-4-class models locally would require hundreds of gigabytes of VRAM, placing them firmly out of reach for all but the best-funded institutions.
+
+This resource intensity creates a fundamental tension in the deployment of LLMs. While cloud-based APIs provide convenient access to powerful models, they introduce significant concerns:
+
+\begin{itemize}
+    \item \textbf{Data Privacy:} Sensitive information must be transmitted to third-party servers, creating compliance challenges for regulated industries and privacy concerns for individual users.
+    \item \textbf{Latency:} Network round-trips introduce delays that can render applications unresponsive, particularly for real-time use cases.
+    \item \textbf{Cost:} API usage fees accumulate rapidly for high-volume applications, potentially exceeding the cost of local hardware over time.
+    \item \textbf{Vendor Lock-in:} Dependence on specific providers creates business continuity risks and limits flexibility.
+    \item \textbf{Rate Limits:} API quotas constrain experimentation and high-throughput applications.
+\end{itemize}
+
+Local deployment offers an alternative but is often perceived as requiring expensive hardware investments beyond the reach of individual researchers, small teams, or hobbyist developers. The prevailing assumption has been that capable local inference requires high-end GPUs with substantial VRAM, creating a barrier to entry that excludes many potential users.
 
 \begin{tcolorbox}[title=The Local LLM Challenge]
 How can we make capable language models accessible on widely available consumer hardware, without sacrificing the interactive performance and quality that make LLMs useful?

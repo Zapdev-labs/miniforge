@@ -153,80 +153,71 @@ This accommodates:
 
 \subsubsection{Hard Limits}
 
-Hard limits prevent allocation beyond physical capacity:
+Hard limits prevent allocation beyond physical capacity. The memory check function accounts for already allocated resources:
 
-\begin{lstlisting}[language=Python, caption=Memory Limit Enforcement]
-def check_memory_available(self, required_gb: float) -> bool:
-    stats = self.get_stats()
-    # Account for already allocated model/cache memory
-    available = (
-        stats.available_gb - 
-        self.current_model_memory - 
-        self.current_kv_memory
-    )
-    return available >= required_gb
-\end{lstlisting}
+\textbf{Memory Check Logic:}
+\begin{enumerate}
+    \item Query current system memory statistics
+    \item Subtract existing model weights allocation
+    \item Subtract current KV cache allocation
+    \item Compare remaining against requested requirement
+\end{enumerate}
+
+This ensures that cumulative allocations never exceed available physical memory, preventing OOM crashes.
 
 \subsection{Memory Tracking and Statistics}
 
-The MemoryManager provides comprehensive memory tracking:
+The MemoryManager provides comprehensive memory tracking through a structured statistics interface:
 
-\begin{lstlisting}[language=Python, caption=Memory Statistics]
-@dataclass
-class MemoryStats:
-    total_gb: float          # Total system RAM
-    available_gb: float      # Currently available
-    used_gb: float          # Currently used
-    percent_used: float     # Usage percentage
-    model_memory_gb: float  # Model weights
-    kv_cache_gb: float      # KV cache allocation
-\end{lstlisting}
+\begin{table}[h]
+\centering
+\caption{Memory Statistics Fields}
+\label{tab:memory_stats_fields}
+\begin{tabular}{lll}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Description} \\
+\midrule
+total\_gb & float & Total system RAM capacity \\
+available\_gb & float & Currently unallocated memory \\
+used\_gb & float & Currently allocated memory \\
+percent\_used & float & Memory utilization percentage \\
+model\_memory\_gb & float & Memory allocated to model weights \\
+kv\_cache\_gb & float & Memory allocated to KV cache \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These statistics are collected periodically and exposed for monitoring, alerting, and debugging purposes.
 
 \subsection{Optimal Settings Generation}
 
-The \texttt{get\_optimal\_settings} method generates complete configurations:
+The optimal settings generation method produces complete configurations tailored to the target model and hardware. The process involves:
 
-\begin{lstlisting}[language=Python, caption=Optimal Settings Generation]
-def get_optimal_settings(
-    self,
-    model_params_billions: float
-) -> Dict[str, Any]:
-    quant = self.select_quantization(model_params_billions)
-    
-    # Calculate model size
-    fp16_size = model_params_billions * 2
-    ratios = {"Q8_0": 1.0, "Q6_K": 0.75, "Q5_K_M": 0.625,
-              "Q4_K_M": 0.5, "Q3_K_M": 0.375, "Q2_K": 0.25}
-    model_size = fp16_size * ratios.get(quant, 0.5)
-    
-    # Context and batch sizing
-    kv_type = "turbo3"
-    max_ctx = self.calculate_max_context(model_size, kv_type)
-    
-    cpu_count = psutil.cpu_count(logical=False) or 4
-    
-    # Batch sizes based on context
-    if max_ctx >= 131072:
-        batch_size = 2048
-        ubatch_size = 512
-    elif max_ctx >= 8192:
-        batch_size = 1024
-        ubatch_size = 512
-    else:
-        batch_size = 512
-        ubatch_size = 256
-    
-    return {
-        "quantization": quant,
-        "n_ctx": max_ctx,
-        "cache_type_k": kv_type,
-        "cache_type_v": kv_type,
-        "n_threads": cpu_count,
-        "n_batch": batch_size,
-        "n_ubatch": ubatch_size,
-        "flash_attn": True,
-    }
-\end{lstlisting}
+\textbf{Configuration Generation Steps:}
+\begin{enumerate}
+    \item \textbf{Quantization Selection:} Choose compression level based on model size
+    \item \textbf{Size Calculation:} Compute quantized model footprint using compression ratios
+    \item \textbf{Context Calculation:} Determine maximum context given remaining memory
+    \item \textbf{Thread Allocation:} Set thread count to physical CPU cores
+    \item \textbf{Batch Sizing:} Configure batch and micro-batch sizes based on context
+\end{enumerate}
+
+\begin{table}[h]
+\centering
+\caption{Batch Size Selection Criteria}
+\label{tab:batch_sizing}
+\begin{tabular}{lll}
+\toprule
+\textbf{Context Size} & \textbf{Batch Size} & \textbf{Micro-Batch} \\
+\midrule
+$\geq$ 131,072 tokens & 2048 & 512 \\
+$\geq$ 8,192 tokens & 1024 & 512 \\
+$<$ 8,192 tokens & 512 & 256 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The resulting configuration includes all parameters needed for backend initialization, optimized for the GMKtech M7 platform.
 
 \subsection{Context Fallback Strategy}
 
@@ -256,29 +247,25 @@ We reserve 2GB for working memory, sufficient for MiniMax M2.7 with substantial 
 
 \subsection{Memory Profiling and Diagnostics}
 
-The framework includes diagnostic capabilities:
+The framework includes diagnostic capabilities for memory usage analysis:
 
-\begin{lstlisting}[language=Python, caption=Memory Profiling]
-async def profile_memory_usage(self, prompt: str, max_tokens: int):
-    tracemalloc.start()
-    
-    # Baseline
-    baseline = self.get_memory_info()
-    
-    # Generate
-    result = await self.model.generate(prompt, max_tokens=max_tokens)
-    
-    # Peak
-    current, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    
-    return {
-        "baseline_mb": baseline.rss_mb,
-        "peak_mb": peak / 1024 / 1024,
-        "increase_mb": (peak - baseline.rss * 1024 * 1024) / 1024 / 1024,
-        "snapshots": tracemalloc.snapshot(),
-    }
-\end{lstlisting}
+\textbf{Profiling Process:}
+\begin{enumerate}
+    \item \textbf{Baseline Capture:} Record initial memory state before generation
+    \item \textbf{Execution:} Run generation with specified prompt and token count
+    \item \textbf{Peak Detection:} Identify maximum memory usage during operation
+    \item \textbf{Analysis:} Calculate increase and capture allocation snapshots
+\end{enumerate}
+
+\textbf{Collected Metrics:}
+\begin{itemize}
+    \item Baseline RSS memory (MB)
+    \item Peak memory consumption (MB)
+    \item Net increase from baseline (MB)
+    \item Allocation snapshots for leak detection
+\end{itemize}
+
+This profiling capability enables developers to identify memory-intensive operations and validate optimization effectiveness.
 
 \subsection{Memory Efficiency Score}
 

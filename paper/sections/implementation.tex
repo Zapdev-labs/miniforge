@@ -1,259 +1,232 @@
 \section{Implementation Details}
 \label{sec:implementation}
 
-\subsection{Code Organization}
+\subsection{Package Architecture}
 
-Miniforge follows a modular package structure:
+Miniforge follows a modular, layered architecture designed for maintainability and extensibility. The package is organized into distinct functional modules:
 
-\begin{lstlisting}[language=bash, caption=Package Structure]
-miniforge/
-|-- __init__.py          # Main exports
-|-- core/                # Core engine
-|   |-- engine.py        # InferenceEngine
-|   |-- memory.py        # MemoryManager
-|   -- backends/        # Backend implementations
-|       |-- llama_cpp.py
-|       -- transformers.py
-|-- models/              # Model management
-|   |-- minimax.py       # Main interface
-|   |-- registry.py      # Model registry
-|   -- gguf_convert.py  # Conversion utilities
-|-- generation/           # Generation utilities
-|   |-- streaming.py
-|   -- tools.py
-|-- multimodal/          # Vision support
-|   -- vision.py
--- utils/               # Utilities
-    -- config.py        # M7Config
-\end{lstlisting}
+\begin{table}[h]
+\centering
+\caption{Miniforge Package Structure}
+\label{tab:package_structure}
+\begin{tabular}{lp{8cm}}
+\toprule
+\textbf{Module} & \textbf{Responsibilities} \\
+\midrule
+\texttt{core/} & Core inference engine, memory management, and backend abstractions \\
+\texttt{models/} & Model loading, registry, and GGUF conversion utilities \\
+\texttt{generation/} & Text generation utilities, streaming, and tool calling \\
+\texttt{multimodal/} & Vision processing and multi-modal input handling \\
+\texttt{utils/} & Configuration management and system utilities \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\subsection{Async Implementation}
+The modular design enables independent development and testing of each component while maintaining clean interfaces between layers.
 
-Async programming patterns throughout Miniforge:
+\subsection{Async Implementation Patterns}
 
 \subsubsection{Thread Pool Delegation}
 
-CPU-intensive operations run in thread pools to avoid blocking:
+CPU-intensive operations such as model inference are executed in thread pools to prevent blocking the async event loop. This pattern allows Miniforge to handle concurrent requests efficiently while maintaining responsive I/O operations.
 
-\begin{lstlisting}[language=Python, caption=Thread Pool Pattern]
-async def generate(self, prompt: str, **kwargs) -> str:
-    if not self._initialized:
-        await self.initialize()
-    
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,  # Default executor
-        lambda: self._llm.create_completion(
-            prompt=prompt, **kwargs
-        )
-    )
-    return result["choices"][0]["text"]
-\end{lstlisting}
+\textbf{Key characteristics:}
+\begin{itemize}
+    \item Default thread pool sized to number of CPU cores
+    \item Operations delegated via \texttt{run\_in\_executor}
+    \item Automatic backpressure when pool is saturated
+    \item Graceful cancellation support
+\end{itemize}
 
-\subsubsection{Streaming with Async Generators}
+\subsubsection{Streaming Architecture}
 
-Token streaming uses async generators:
+Token streaming uses async generators to yield partial results as they become available. This enables real-time output delivery without waiting for complete generation.
 
-\begin{lstlisting}[language=Python, caption=Streaming Implementation]
-async def generate_stream(self, prompt: str, **kwargs):
-    loop = asyncio.get_event_loop()
-    
-    stream = await loop.run_in_executor(
-        None,
-        lambda: self._llm.create_completion(
-            prompt=prompt, stream=True, **kwargs
-        )
-    )
-    
-    for chunk in stream:
-        text = chunk["choices"][0].get("text", "")
-        if text:
-            yield text
-        await asyncio.sleep(0)  # Yield control
-\end{lstlisting}
+\textbf{Flow:}
+\begin{enumerate}
+    \item User calls streaming generation endpoint
+    \item Backend initiates streaming completion
+    \item Chunks are yielded as \texttt{AsyncIterator[str]}
+    \item Client receives tokens with minimal latency
+    \item Stream ends with completion signal
+\end{enumerate}
 
-\subsection{Configuration Management}
+\subsection{Configuration System}
 
-Configuration uses dataclasses with validation:
+Configuration management uses dataclasses with built-in validation:
 
-\begin{lstlisting}[language=Python, caption=Configuration Dataclass]
-@dataclass
-class M7Config:
-    max_memory_gb: float = 24.0
-    n_threads: int = 8
-    n_ctx: int = 194_560
-    quantization: str = "Q4_K_M"
-    cache_type_k: str = "turbo3"
-    cache_type_v: str = "turbo3"
-    flash_attn: bool = True
-    
-    def __post_init__(self):
-        # Validation
-        valid_quants = ["Q2_K", "Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"]
-        if self.quantization not in valid_quants:
-            self.quantization = "Q4_K_M"
-\end{lstlisting}
+\begin{table}[h]
+\centering
+\caption{M7Config Key Parameters}
+\label{tab:config_params}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Default} & \textbf{Description} \\
+\midrule
+max\_memory\_gb & 24.0 & Maximum memory allocation \\
+n\_threads & 8 & CPU threads for inference \\
+n\_ctx & 194,560 & Context window size (tokens) \\
+quantization & Q4\_K\_M & Model quantization level \\
+cache\_type\_k & turbo3 & Key cache compression \\
+cache\_type\_v & turbo3 & Value cache compression \\
+flash\_attn & True & Flash attention enabled \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\subsection{Error Handling}
+Validation ensures invalid configurations fall back to safe defaults, preventing runtime errors from misconfiguration.
 
-Comprehensive error handling with graceful degradation:
+\subsection{Error Handling Strategy}
 
-\begin{lstlisting}[language=Python, caption=Error Handling]
-try:
-    from llama_cpp import Llama
-except ImportError:
-    raise ImportError(
-        "llama-cpp-python not installed. "
-        "Install with: uv pip install llama-cpp-python"
-    )
+Miniforge implements comprehensive error handling with graceful degradation at multiple levels:
 
-# Context fallback
-for candidate_ctx in _context_fallbacks(requested_n_ctx, max_safe_ctx):
-    kwargs["n_ctx"] = candidate_ctx
-    try:
-        self._llm = await loop.run_in_executor(
-            None, lambda: Llama(**kwargs)
-        )
-        break
-    except ValueError as exc:
-        logger.warning(f"Failed with n_ctx={candidate_ctx}: {exc}")
-        continue
-\end{lstlisting}
+\textbf{Dependency Management:}
+\begin{itemize}
+    \item Optional dependencies are checked at runtime
+    \item Clear error messages guide installation
+    \item Fallback backends available when primary unavailable
+\end{itemize}
 
-\subsection{Memory Management Implementation}
+\textbf{Context Fallback:}
+\begin{itemize}
+    \item Requested context window attempted first
+    \item Progressive reduction on memory failure
+    \item Minimum viable context (4K) always attempted
+    \item Clear logging of fallback decisions
+\end{itemize}
 
-Memory tracking uses psutil for system monitoring:
+\subsection{Memory Monitoring}
 
-\begin{lstlisting}[language=Python, caption=Memory Monitoring]
-def get_stats(self) -> MemoryStats:
-    mem = psutil.virtual_memory()
-    return MemoryStats(
-        total_gb=mem.total / (1024**3),
-        available_gb=mem.available / (1024**3),
-        used_gb=mem.used / (1024**3),
-        percent_used=mem.percent,
-        model_memory_gb=self.current_model_memory,
-        kv_cache_gb=self.current_kv_memory,
-    )
-\end{lstlisting}
+Real-time memory tracking uses system-level monitoring:
 
-\subsection{Tool Calling Implementation}
+\begin{table}[h]
+\centering
+\caption{Memory Statistics Collection}
+\label{tab:memory_stats}
+\begin{tabular}{ll}
+\toprule
+\textbf{Metric} & \textbf{Source} \\
+\midrule
+Total system memory & OS memory API \\
+Available memory & OS memory API \\
+Used memory percentage & System monitor \\
+Model weights allocation & Internal tracking \\
+KV cache allocation & Backend reporting \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-Tool calling support with async execution:
+Statistics are collected periodically and exposed via the \texttt{MemoryManager} interface for monitoring and alerting.
 
-\begin{lstlisting}[language=Python, caption=Tool Execution]
-async def execute_single(self, tool_call: ToolCall) -> ToolResult:
-    name = tool_call.name
-    handler = self._handlers[name]
-    
-    try:
-        if asyncio.iscoroutinefunction(handler):
-            result = await handler(**tool_call.arguments)
-        else:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: handler(**tool_call.arguments)
-            )
-        
-        return ToolResult(
-            tool_call_id=tool_call.id,
-            content=str(result),
-            is_error=False,
-        )
-    except Exception as e:
-        return ToolResult(
-            tool_call_id=tool_call.id,
-            content=f"Error: {e}",
-            is_error=True,
-        )
-\end{lstlisting}
+\subsection{Tool Calling Framework}
 
-\subsection{Vision Processing}
+The tool execution framework supports both sync and async handlers:
 
-Vision support with PIL for image handling:
+\textbf{Execution Flow:}
+\begin{enumerate}
+    \item Tool call request parsed from model output
+    \item Handler looked up by tool name
+    \item Handler type detected (coroutine vs function)
+    \item Execution delegated appropriately
+    \item Result formatted and returned to model
+    \item Errors captured and reported gracefully
+\end{enumerate}
 
-\begin{lstlisting}[language=Python, caption=Vision Processing]
-class VisionProcessor:
-    def preprocess(self, image, target_size=None):
-        from PIL import Image
-        
-        if not isinstance(image, Image.Image):
-            img = self.load_image(image)
-        else:
-            img = image
-        
-        # Convert to RGB
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        
-        # Resize
-        if target_size:
-            img = img.resize(target_size, Image.Resampling.LANCZOS)
-        elif max(img.size) > self.max_size:
-            img.thumbnail((self.max_size, self.max_size))
-        
-        return img
-    
-    def encode_base64(self, image, format="PNG") -> str:
-        img = self.preprocess(image)
-        buffer = BytesIO()
-        img.save(buffer, format=format)
-        return base64.b64encode(buffer.getvalue()).decode()
-\end{lstlisting}
+\textbf{Handler Types Supported:}
+\begin{itemize}
+    \item Async functions (\texttt{async def})
+    \item Sync functions (wrapped in thread pool)
+    \item Class-based handlers with lifecycle
+    \item External service proxies
+\end{itemize}
+
+\subsection{Vision Processing Pipeline}
+
+Image processing for multimodal models follows a standardized pipeline:
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    box/.style={rectangle, draw, fill=miniforgeblue!20, minimum width=3cm, minimum height=0.8cm, align=center},
+    arrow/.style={->, thick}
+]
+\node[box] (input) {Input Image};
+\node[box, right=of input] (load) {Load/Decode};
+\node[box, right=of load] (convert) {RGB Conversion};
+\node[box, below=of convert] (resize) {Resize/Thumbnail};
+\node[box, left=of resize] (encode) {Base64 Encode};
+\node[box, left=of encode] (output) {API Ready};
+
+\draw[arrow] (input) -- (load);
+\draw[arrow] (load) -- (convert);
+\draw[arrow] (convert) -- (resize);
+\draw[arrow] (resize) -- (encode);
+\draw[arrow] (encode) -- (output);
+\end{tikzpicture}
+\caption{Vision Processing Pipeline}
+\label{fig:vision_pipeline}
+\end{figure}
+
+Each stage handles format conversion, validation, and optimization for model input requirements.
 
 \subsection{Type Safety}
 
-Strict typing throughout the codebase:
+Strict typing throughout the codebase ensures API clarity and IDE support:
 
-\begin{lstlisting}[language=Python, caption=Type Annotations]
-from typing import Optional, Dict, Any, List, AsyncIterator, Union
+\textbf{Type Coverage:}
+\begin{itemize}
+    \item All public APIs fully typed
+    \item Generic types for flexible interfaces
+    \item Union types for multi-return functions
+    \item Optional types for nullable parameters
+\end{itemize}
 
-async def chat(
-    self,
-    message: str,
-    history: Optional[List[Dict[str, str]]] = None,
-    system_prompt: Optional[str] = None,
-    max_tokens: Optional[int] = None,
-    temperature: Optional[float] = None,
-    tools: Optional[List[Tool]] = None,
-    stream: bool = False,
-) -> Union[str, AsyncIterator[str]]:
-    ...
-\end{lstlisting}
+\textbf{Benefits:}
+\begin{itemize}
+    \item Compile-time error detection via mypy
+    \item Enhanced IDE autocomplete
+    \item Self-documenting function signatures
+    \item Safer refactoring
+\end{itemize}
 
 \subsection{Testing Strategy}
 
-Comprehensive test coverage:
+Comprehensive test coverage across multiple dimensions:
 
+\begin{table}[h]
+\centering
+\caption{Test Coverage by Category}
+\label{tab:test_coverage}
+\begin{tabular}{lll}
+\toprule
+\textbf{Category} & \textbf{Focus} & \textbf{Tools} \\
+\midrule
+Unit Tests & Individual components & pytest \\
+Integration Tests & End-to-end workflows & pytest-asyncio \\
+Benchmark Tests & Performance regression & Custom harness \\
+Memory Tests & OOM prevention & Stress testing \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key Test Scenarios:}
 \begin{itemize}
-    \item \textbf{Unit tests:} Individual component testing
-    \item \textbf{Integration tests:} End-to-end workflows
-    \item \textbf{Benchmark tests:} Performance regression detection
-    \item \textbf{Memory tests:} OOM prevention validation
+    \item Memory manager quantization selection
+    \item Backend fallback under failure
+    \item Streaming under high concurrency
+    \item Context window boundary conditions
+    \item Tool calling error recovery
 \end{itemize}
-
-\begin{lstlisting}[language=Python, caption=Example Test]
-def test_memory_manager_select_quantization():
-    mem = MemoryManager()
-    
-    # 2.7B model should fit with Q4_K_M
-    quant = mem.select_quantization(2.7)
-    assert quant in ["Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K"]
-    
-    # 7B model might need more aggressive quantization
-    quant_7b = mem.select_quantization(7.0)
-    assert quant_7b in ["Q3_K_M", "Q4_K_M"]
-\end{lstlisting}
 
 \subsection{Documentation}
 
-Documentation includes:
+Documentation is maintained at multiple levels:
 
 \begin{itemize}
-    \item Docstrings for all public APIs
-    \item Type hints for function signatures
-    \item Usage examples in docstrings
-    \item README with quickstart guide
-    \item Architecture documentation
+    \item \textbf{API Docstrings:} All public classes and methods
+    \item \textbf{Type Hints:} Function signatures with parameter types
+    \item \textbf{Usage Examples:} Inline examples in docstrings
+    \item \textbf{README:} Quickstart and installation guide
+    \item \textbf{Architecture Docs:} Design decisions and patterns
 \end{itemize}
