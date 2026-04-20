@@ -46,12 +46,22 @@ class MeshDashboard:
         self.sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins="*")
         self.sio.attach(self.app)
         
-        # Setup templates
+        # Setup templates - use PackageLoader for better compatibility
         template_dir = Path(__file__).parent / "static"
-        aiohttp_jinja2.setup(
-            self.app,
-            loader=jinja2.FileSystemLoader(str(template_dir))
-        )
+        try:
+            # Try FileSystemLoader first
+            env = aiohttp_jinja2.setup(
+                self.app,
+                loader=jinja2.FileSystemLoader(str(template_dir)),
+                context_processors=[aiohttp_jinja2.request_processor],
+            )
+            # Add global url function
+            env.globals['url'] = lambda name, **kwargs: f"/static/{kwargs.get('filename', '')}"
+        except Exception as e:
+            logger.warning(f"Jinja2 setup warning: {e}")
+        
+        # Store template dir for fallback
+        self._template_dir = template_dir
         
         # State
         self._site: Optional[web.TCPSite] = None
@@ -66,12 +76,18 @@ class MeshDashboard:
         
     def _setup_routes(self) -> None:
         """Setup HTTP routes."""
-        self.app.router.add_get("/", self.index)
+        # Static files must be added BEFORE template routes
+        static_dir = Path(__file__).parent / "static"
+        self.app.router.add_static("/static", static_dir, name="static")
+        
+        # API routes
         self.app.router.add_get("/api/status", self.api_status)
         self.app.router.add_post("/api/chat", self.api_chat)
         self.app.router.add_get("/api/nodes", self.api_nodes)
         self.app.router.add_post("/api/connect", self.api_connect)
-        self.app.router.add_static("/static", Path(__file__).parent / "static")
+        
+        # Main page - must be last to not conflict with static
+        self.app.router.add_get("/", self.index)
         
     def _setup_socketio(self) -> None:
         """Setup Socket.IO event handlers."""
@@ -138,12 +154,31 @@ class MeshDashboard:
         
     async def index(self, request: web.Request) -> web.Response:
         """Serve main dashboard page."""
-        context = {
-            "node_id": self.coordinator.node_id,
-            "node_name": self.coordinator.node_name,
-            "is_leader": self.coordinator.is_leader,
-        }
-        return aiohttp_jinja2.render_template("index.html", request, context)
+        try:
+            context = {
+                "node_id": self.coordinator.node_id,
+                "node_name": self.coordinator.node_name,
+                "is_leader": self.coordinator.is_leader,
+            }
+            return aiohttp_jinja2.render_template("index.html", request, context)
+        except Exception as e:
+            logger.error(f"Template render error: {e}")
+            # Return simple HTML as fallback
+            return web.Response(
+                text=f"""
+<!DOCTYPE html>
+<html>
+<head><title>Miniforge Mesh</title></head>
+<body>
+    <h1>Miniforge Mesh - {self.coordinator.node_name}</h1>
+    <p>Node ID: {self.coordinator.node_id}</p>
+    <p>Leader: {self.coordinator.is_leader}</p>
+    <p><a href="/static/index.html">Try static fallback</a></p>
+</body>
+</html>
+""",
+                content_type="text/html"
+            )
         
     async def api_status(self, request: web.Request) -> web.Response:
         """Get current mesh status."""
