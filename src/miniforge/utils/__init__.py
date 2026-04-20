@@ -1,24 +1,28 @@
 """Utility functions and helpers."""
 
-from typing import Optional
-from pathlib import Path
 import logging
 import sys
+from pathlib import Path
+from typing import Optional
 
 from miniforge.utils.config import M7Config
-from miniforge.utils.monitoring import PerformanceMonitor, MemoryMonitor, GenerationMetrics
+from miniforge.utils.hardware import HardwareProfile, auto_config, detect_hardware
+from miniforge.utils.monitoring import GenerationMetrics, MemoryMonitor, PerformanceMonitor
 
 __all__ = [
     "M7Config",
     "PerformanceMonitor",
     "MemoryMonitor",
     "GenerationMetrics",
+    "detect_hardware",
+    "auto_config",
+    "HardwareProfile",
 ]
 
 
 def setup_logging(
     level: str = "INFO",
-    format_string: Optional[str] = None,
+    format_string: str | None = None,
 ) -> None:
     """Setup logging configuration."""
     if format_string is None:

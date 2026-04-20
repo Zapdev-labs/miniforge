@@ -2,12 +2,13 @@
 
 import argparse
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
 
-from miniforge.utils.config import M7Config, create_default_config_file, _default_config_dir
 from miniforge.models.registry import get_registry
+from miniforge.utils.config import M7Config, _default_config_dir, create_default_config_file
 
 
 def cmd_chat(args):
@@ -77,8 +78,42 @@ def cmd_chat(args):
 
 def cmd_server(args):
     """Run API server."""
-    print("Server mode not yet implemented.")
-    print("Use examples/server_api.py for now.")
+    from miniforge.webui.server import run_server
+
+    run_server(
+        host=args.host,
+        port=args.port,
+        model=args.model,
+        backend=args.backend or "llama_cpp",
+        quantization=args.quantization,
+        config=args.config,
+    )
+
+
+def cmd_webui(args):
+    """Launch full WebUI stack (API + OpenWebUI + Grafana)."""
+    import subprocess
+    import sys
+
+    # Pass through to start.sh orchestrator
+    env = os.environ.copy()
+    if args.model:
+        env["MINIFORGE_MODEL"] = args.model
+    if args.backend:
+        env["MINIFORGE_BACKEND"] = args.backend
+    if args.quantization:
+        env["MINIFORGE_QUANTIZATION"] = args.quantization
+    if args.config:
+        env["MINIFORGE_CONFIG"] = args.config
+    env["MINIFORGE_PORT"] = str(args.port)
+    env["MINIFORGE_HOST"] = args.host
+
+    start_script = Path(__file__).parent.parent.parent / "start.sh"
+    if not start_script.exists():
+        print(f"start.sh not found at {start_script}")
+        sys.exit(1)
+
+    subprocess.run([str(start_script)], env=env)
 
 
 def cmd_download(args):
@@ -121,9 +156,9 @@ def cmd_config(args):
     if args.create:
         path = create_default_config_file()
         print(f"Config created at: {path}")
-        print(f"\nEdit it to set download_dir, n_ctx, quantization, etc.")
-        print(f"Example — add this to set your download directory:")
-        print(f"  download_dir: \"D:/AI\"")
+        print("\nEdit it to set download_dir, n_ctx, quantization, etc.")
+        print("Example — add this to set your download directory:")
+        print('  download_dir: "D:/AI"')
     else:
         print(f"Config file location: {config_path}")
         print(f"  (exists: {config_path.exists()})")
@@ -162,7 +197,20 @@ def main():
     server_parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
     server_parser.add_argument("--port", "-p", type=int, default=8000, help="Port to bind")
     server_parser.add_argument("--model", "-m", help="Model ID or path")
+    server_parser.add_argument("--backend", default="llama_cpp", help="Backend to use")
+    server_parser.add_argument("--quantization", "-q", help="Quantization type")
+    server_parser.add_argument("--config", "-c", help="Config file path")
     server_parser.set_defaults(func=cmd_server)
+
+    # WebUI command (full stack)
+    webui_parser = subparsers.add_parser("webui", help="Launch API + OpenWebUI + Grafana")
+    webui_parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
+    webui_parser.add_argument("--port", "-p", type=int, default=8000, help="API port to bind")
+    webui_parser.add_argument("--model", "-m", help="Model ID or path")
+    webui_parser.add_argument("--backend", default="llama_cpp", help="Backend to use")
+    webui_parser.add_argument("--quantization", "-q", help="Quantization type")
+    webui_parser.add_argument("--config", "-c", help="Config file path")
+    webui_parser.set_defaults(func=cmd_webui)
 
     # Download command
     download_parser = subparsers.add_parser("download", help="Download model")

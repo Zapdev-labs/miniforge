@@ -1,12 +1,13 @@
 """Configuration management for Miniforge."""
 
-from typing import Any, Dict, Optional, Union
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
+import logging
 import os
 import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
 import yaml
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +38,15 @@ class M7Config:
     priority: str = "normal"  # Thread priority: "normal", "realtime", "high"
 
     # CPU ISA extensions (auto-detected if None)
-    use_avx: Optional[bool] = None
-    use_avx2: Optional[bool] = None
-    use_avx512: Optional[bool] = None
-    use_fma: Optional[bool] = None
-    use_f16c: Optional[bool] = None
+    use_avx: bool | None = None
+    use_avx2: bool | None = None
+    use_avx512: bool | None = None
+    use_fma: bool | None = None
+    use_f16c: bool | None = None
 
     # Model settings
     model_id: str = DEFAULT_MODEL_ID
-    model_weights_path: Optional[str] = None
+    model_weights_path: str | None = None
     n_ctx: int = 194_560  # Full 192K context minus safety headroom (196608 - 2048)
     quantization: str = "UD-IQ2_XXS"  # Default for MiniMax M2.7 228B MoE on 28GB
 
@@ -61,19 +62,19 @@ class M7Config:
 
     # Speculative decoding (draft model acceleration)
     speculative_n_max: int = 16  # Max draft tokens to speculatively decode
-    speculative_n_min: int = 5   # Min draft tokens for speculative mode
+    speculative_n_min: int = 5  # Min draft tokens for speculative mode
     speculative_p_min: float = 0.8  # Min acceptance probability to continue drafting
 
     # GPU offloading (for AMD Radeon 680M iGPU)
     n_gpu_layers: int = 0  # Set to 15-20 to offload some layers to 4GB VRAM
     main_gpu: int = 0  # Primary GPU device
-    tensor_split: Optional[list[float]] = None  # For multi-GPU setups
+    tensor_split: list[float] | None = None  # For multi-GPU setups
 
     # Performance features
     flash_attn: bool = True
     use_mmap: bool = True
     use_mlock: bool = False  # WSL2 doesn't support mlock
-    rope_scaling_type: Optional[str] = "linear"  # For long context scaling
+    rope_scaling_type: str | None = "linear"  # For long context scaling
     rope_freq_base: float = 10000.0  # Default RoPE base frequency
     rope_freq_scale: float = 1.0  # RoPE scaling factor (1.0 = no scaling)
 
@@ -92,12 +93,12 @@ class M7Config:
     enable_streaming: bool = True
 
     # Paths
-    cache_dir: Optional[str] = None
-    download_dir: Optional[str] = None  # Override where GGUF shards are downloaded (e.g. "D:/AI")
-    llama_cpp_path: Optional[str] = None
+    cache_dir: str | None = None
+    download_dir: str | None = None  # Override where GGUF shards are downloaded (e.g. "D:/AI")
+    llama_cpp_path: str | None = None
 
     # Per-model overrides (set automatically from registry, or manually)
-    max_model_ctx: Optional[int] = None  # Model's trained context ceiling (e.g. 262144 for Kimi K2.5)
+    max_model_ctx: int | None = None  # Model's trained context ceiling (e.g. 262144 for Kimi K2.5)
     is_moe: bool = False  # Mixture-of-Experts: forces mmap=True, mlock=False, caps default n_ctx
 
     # Logging
@@ -111,14 +112,40 @@ class M7Config:
 
         valid_quants = [
             # Standard GGUF quants
-            "Q2_K", "Q3_K", "Q3_K_S", "Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "F16",
+            "Q2_K",
+            "Q3_K",
+            "Q3_K_S",
+            "Q3_K_M",
+            "Q4_K_M",
+            "Q5_K_M",
+            "Q6_K",
+            "Q8_0",
+            "F16",
             # Unsloth UD-* quants (1-bit through 8-bit)
-            "UD-TQ1_0", "UD-IQ1_S", "UD-IQ1_M",
-            "UD-IQ2_XXS", "UD-IQ2_M", "UD-Q2_K_XL",
-            "UD-IQ3_XXS", "UD-IQ3_S", "UD-IQ3_K_S", "UD-Q3_K_M", "UD-Q3_K_XL",
-            "UD-IQ4_XS", "UD-Q4_K_S", "MXFP4_MOE", "UD-Q4_NL", "UD-Q4_K_M", "UD-Q4_K_XL",
-            "UD-Q5_K_S", "UD-Q5_K_M", "UD-Q5_K_XL",
-            "UD-Q6_K", "UD-Q6_K_XL", "UD-Q8_K_XL", "BF16",
+            "UD-TQ1_0",
+            "UD-IQ1_S",
+            "UD-IQ1_M",
+            "UD-IQ2_XXS",
+            "UD-IQ2_M",
+            "UD-Q2_K_XL",
+            "UD-IQ3_XXS",
+            "UD-IQ3_S",
+            "UD-IQ3_K_S",
+            "UD-Q3_K_M",
+            "UD-Q3_K_XL",
+            "UD-IQ4_XS",
+            "UD-Q4_K_S",
+            "MXFP4_MOE",
+            "UD-Q4_NL",
+            "UD-Q4_K_M",
+            "UD-Q4_K_XL",
+            "UD-Q5_K_S",
+            "UD-Q5_K_M",
+            "UD-Q5_K_XL",
+            "UD-Q6_K",
+            "UD-Q6_K_XL",
+            "UD-Q8_K_XL",
+            "BF16",
         ]
         if self.quantization not in valid_quants:
             logger.warning(f"Unknown quantization {self.quantization}, using Q4_K_M")
@@ -186,7 +213,28 @@ class M7Config:
         return config
 
     @classmethod
-    def from_yaml(cls, path: Union[str, Path]) -> "M7Config":
+    def from_hardware(
+        cls,
+        model_params_b: float = 2.7,
+        is_moe: bool = False,
+    ) -> "M7Config":
+        """Create a configuration auto-tuned to the current hardware.
+
+        Args:
+            model_params_b: Model size in billions of parameters.
+            is_moe: Whether the model is a Mixture-of-Experts.
+
+        Returns:
+            M7Config instance tuned to detected CPU, RAM, and GPU.
+        """
+        from miniforge.utils.hardware import auto_config, detect_hardware
+
+        profile = detect_hardware()
+        settings = auto_config(model_params_b=model_params_b, is_moe=is_moe, profile=profile)
+        return cls(**settings)
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> "M7Config":
         """Load configuration from YAML file."""
         path = Path(path)
 
@@ -204,7 +252,7 @@ class M7Config:
 
         return cls(**filtered_data)
 
-    def to_yaml(self, path: Union[str, Path]) -> None:
+    def to_yaml(self, path: str | Path) -> None:
         """Save configuration to YAML file."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -214,11 +262,11 @@ class M7Config:
 
         logger.info(f"Configuration saved to {path}")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return asdict(self)
 
-    def get_backend_config(self) -> Dict[str, Any]:
+    def get_backend_config(self) -> dict[str, Any]:
         """Get backend-specific configuration."""
         config = {
             "n_ctx": self.n_ctx,
@@ -261,7 +309,7 @@ class M7Config:
             config["is_moe"] = True
         return config
 
-    def get_generation_defaults(self) -> Dict[str, Any]:
+    def get_generation_defaults(self) -> dict[str, Any]:
         """Get default generation parameters."""
         return {
             "max_tokens": self.default_max_tokens,
@@ -270,7 +318,7 @@ class M7Config:
             "top_k": self.default_top_k,
         }
 
-    def resolved_model_weights_dir(self) -> Optional[Path]:
+    def resolved_model_weights_dir(self) -> Path | None:
         """If set, weights are stored and loaded only from this folder (no duplicate hub cache)."""
         if not self.model_weights_path:
             return None
@@ -291,7 +339,7 @@ def _default_config_dir() -> Path:
     return Path.home() / ".config" / "miniforge"
 
 
-def load_config(config_path: Optional[Union[str, Path]] = None) -> M7Config:
+def load_config(config_path: str | Path | None = None) -> M7Config:
     """
     Load configuration from file or return defaults.
 
@@ -321,7 +369,7 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> M7Config:
     return M7Config()
 
 
-def create_default_config_file(path: Optional[Union[str, Path]] = None) -> Path:
+def create_default_config_file(path: str | Path | None = None) -> Path:
     """Create a default configuration file at the platform-appropriate location."""
     if path is None:
         path = _default_config_dir() / "config.yaml"
