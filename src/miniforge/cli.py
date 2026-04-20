@@ -164,6 +164,14 @@ def main():
     server_parser.add_argument("--model", "-m", help="Model ID or path")
     server_parser.set_defaults(func=cmd_server)
 
+    # Mesh command (distributed inference)
+    try:
+        from miniforge.mesh.cli import add_mesh_subparser
+        add_mesh_subparser(subparsers)
+    except ImportError:
+        # Mesh dependencies not installed
+        pass
+
     # Download command
     download_parser = subparsers.add_parser("download", help="Download model")
     download_parser.add_argument("model", help="Model ID to download")

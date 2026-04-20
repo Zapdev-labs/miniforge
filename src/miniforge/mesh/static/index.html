@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Miniforge Mesh Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <div class="header-left">
+                <h1>🔥 Miniforge Mesh</h1>
+                <span class="node-badge">{{ node_name }}</span>
+                {% if is_leader %}
+                <span class="leader-badge">LEADER</span>
+                {% endif %}
+            </div>
+            <div class="header-right">
+                <span id="nodes-count" class="nodes-badge">1 node</span>
+                <button class="btn btn-secondary" onclick="showConnectModal()">+ Connect</button>
+                <button class="btn btn-primary" onclick="refreshStatus()">Refresh</button>
+            </div>
+        </header>
+
+        <main class="main">
+            <!-- Mesh Status Panel -->
+            <section class="panel mesh-panel">
+                <h2>Mesh Status</h2>
+                <div class="resources-bar">
+                    <div class="resource-item">
+                        <span class="resource-label">Nodes</span>
+                        <span id="total-nodes" class="resource-value">1</span>
+                    </div>
+                    <div class="resource-item">
+                        <span class="resource-label">Total RAM</span>
+                        <span id="total-ram" class="resource-value">28 GB</span>
+                    </div>
+                    <div class="resource-item">
+                        <span class="resource-label">Available RAM</span>
+                        <span id="available-ram" class="resource-value">28 GB</span>
+                    </div>
+                    <div class="resource-item">
+                        <span class="resource-label">CPU Cores</span>
+                        <span id="total-cpus" class="resource-value">8</span>
+                    </div>
+                </div>
+                
+                <div class="nodes-table-wrapper">
+                    <table class="nodes-table" id="nodes-table">
+                        <thead>
+                            <tr>
+                                <th>Node</th>
+                                <th>IP:Port</th>
+                                <th>RAM</th>
+                                <th>CPU</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr class="node-row self">
+                                <td>{{ node_name }} (You)</td>
+                                <td>127.0.0.1</td>
+                                <td>28 GB</td>
+                                <td>8 cores</td>
+                                <td><span class="status-badge active">Active</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Chat Interface -->
+            <section class="panel chat-panel">
+                <h2>Chat</h2>
+                <div class="chat-container">
+                    <div id="chat-messages" class="chat-messages">
+                        <div class="message system">
+                            <p>Welcome to Miniforge Mesh! Start chatting with your distributed LLM.</p>
+                        </div>
+                    </div>
+                    <div class="chat-input-area">
+                        <textarea 
+                            id="chat-input" 
+                            placeholder="Type your message..."
+                            rows="3"
+                        ></textarea>
+                        <div class="chat-controls">
+                            <label class="stream-toggle">
+                                <input type="checkbox" id="stream-mode" checked>
+                                <span>Stream response</span>
+                            </label>
+                            <button class="btn btn-primary" onclick="sendMessage()">Send</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Connect Modal -->
+    <div id="connect-modal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="hideConnectModal()">&times;</span>
+            <h3>Connect to Peer</h3>
+            <p>Enter the IP address of a mesh node to connect to:</p>
+            <input 
+                type="text" 
+                id="peer-ip" 
+                placeholder="192.168.1.100"
+                class="input-field"
+            >
+            <input 
+                type="number" 
+                id="peer-port" 
+                placeholder="9999"
+                value="9999"
+                class="input-field"
+            >
+            <button class="btn btn-primary" onclick="connectToPeer()">Connect</button>
+            <div id="connect-status"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
