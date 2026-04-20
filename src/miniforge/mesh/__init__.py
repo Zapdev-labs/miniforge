@@ -6,6 +6,8 @@ from miniforge.mesh.coordinator import MeshCoordinator, NodeState, InferenceJob
 from miniforge.mesh.engine import DistributedInferenceEngine
 from miniforge.mesh.security import MeshSecurity
 from miniforge.mesh.dashboard import MeshDashboard
+from miniforge.mesh.registry import ModelRegistry, ModelInfo
+from miniforge.mesh.host_worker import HostWorkerEngine
 
 __all__ = [
     "MeshDiscovery",
@@ -16,6 +18,9 @@ __all__ = [
     "NodeState",
     "InferenceJob",
     "DistributedInferenceEngine",
+    "HostWorkerEngine",
     "MeshSecurity",
     "MeshDashboard",
+    "ModelRegistry",
+    "ModelInfo",
 ]

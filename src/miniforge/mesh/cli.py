@@ -37,6 +37,10 @@ async def mesh_up_command(args: argparse.Namespace) -> None:
     - Accept connections from other nodes
     - Distribute inference jobs across the mesh
     - Serve a web dashboard for monitoring and chat
+    
+    Host/Worker Mode:
+    - Host: Stores all models, streams to workers on-demand
+    - Worker: No local models, downloads from host when needed
     """
     # Generate or load node identity
     config_dir = _default_config_dir()
@@ -51,6 +55,10 @@ async def mesh_up_command(args: argparse.Namespace) -> None:
     
     node_name = args.name or f"node-{node_id[:4]}"
     
+    # Determine mode
+    is_host = args.mode == "host"
+    host_node_id: Optional[str] = None
+    
     # Setup logging
     logging.basicConfig(
         level=logging.INFO if not args.verbose else logging.DEBUG,
@@ -60,6 +68,7 @@ async def mesh_up_command(args: argparse.Namespace) -> None:
     print(f"🔥 Miniforge Mesh Starting...")
     print(f"   Node ID: {node_id}")
     print(f"   Name: {node_name}")
+    print(f"   Mode: {args.mode}")
     print(f"   Port: {args.port}")
     print()
     
@@ -98,9 +107,21 @@ async def mesh_up_command(args: argparse.Namespace) -> None:
         local_cpu_cores=args.cores or 8,
     )
     
-    # If specific IP provided, connect to it
+    # Initialize model registry
+    from miniforge.mesh.registry import ModelRegistry
+    registry = ModelRegistry(
+        node_id=node_id,
+        is_host=is_host,
+        cache_dir=config_dir / "mesh_models",
+    )
+    
+    # If specific IP provided for host, connect to it
+    if args.host_ip:
+        print(f"🔗 Will connect to host at {args.host_ip}:{args.port}...")
+    
+    # If specific peer IP provided, connect to it
     if args.ip:
-        print(f"🔗 Connecting to {args.ip}:{args.port}...")
+        print(f"🔗 Connecting to peer {args.ip}:{args.port}...")
         from miniforge.mesh.discovery import PeerInfo
         peer = PeerInfo(
             ip=args.ip,
@@ -111,21 +132,47 @@ async def mesh_up_command(args: argparse.Namespace) -> None:
             cpu_cores=0,
             last_seen=0,
         )
-        # Will be connected by coordinator
     
-    # Initialize local inference engine (placeholder)
-    # In real implementation, load actual model
+    # Initialize local inference engine
     local_engine = InferenceEngine(
         model_path=args.model or "minimax",
         backend="llama_cpp",
     )
     
-    # Initialize distributed engine
-    engine = DistributedInferenceEngine(
-        local_engine=local_engine,
-        coordinator=coordinator,
-        node_id=node_id,
-    )
+    # Register model if host mode and model path provided
+    if is_host and args.model_path:
+        try:
+            registry.register_local_model(
+                model_id=args.model or "minimax",
+                model_path=args.model_path,
+                quantization=args.quantization or "Q4_K_M",
+            )
+            print(f"📦 Registered model: {args.model_path}")
+        except FileNotFoundError as e:
+            print(f"⚠️  Warning: {e}")
+    
+    # Initialize engine based on mode
+    if is_host:
+        # Host uses distributed engine with registry
+        from miniforge.mesh.host_worker import HostWorkerEngine
+        engine = HostWorkerEngine(
+            local_engine=local_engine,
+            coordinator=coordinator,
+            registry=registry,
+            node_id=node_id,
+            is_host=True,
+        )
+    else:
+        # Worker uses host/worker engine
+        from miniforge.mesh.host_worker import HostWorkerEngine
+        engine = HostWorkerEngine(
+            local_engine=local_engine,
+            coordinator=coordinator,
+            registry=registry,
+            node_id=node_id,
+            is_host=False,
+            host_node_id=host_node_id,
+        )
     
     # Initialize dashboard
     dashboard = MeshDashboard(
@@ -152,14 +199,28 @@ async def mesh_up_command(args: argparse.Namespace) -> None:
         nodes = coordinator.all_nodes
         resources = coordinator.total_resources
         
+        # Get model info
+        models = registry.list_local_models()
+        
         print(f"📊 Mesh Status ({len(nodes)} nodes):")
         for node in nodes:
             leader_marker = " 👑" if node.is_leader else ""
             you_marker = " ⭐ You" if node.node_id == node_id else ""
-            print(f"   • {node.node_name}{leader_marker}{you_marker}")
+            host_marker = " 💾 HOST" if is_host and node.node_id == node_id else ""
+            worker_marker = " 🖥️  WORKER" if not is_host and node.node_id == node_id else ""
+            print(f"   • {node.node_name}{leader_marker}{you_marker}{host_marker}{worker_marker}")
             print(f"     {node.ip}:{node.port} | {node.ram_gb}GB RAM | {node.cpu_cores} cores")
         print()
         print(f"💾 Combined Resources: {resources['total_ram_gb']:.0f}GB RAM | {resources['total_cpu_cores']} CPU cores")
+        
+        if models:
+            print()
+            print("📦 Local Models:")
+            for model in models:
+                print(f"   • {model.model_id} ({model.file_size / 1e9:.1f}GB)")
+        elif not is_host:
+            print()
+            print("📦 Models: Will download from host on first use")
         print()
         
         if coordinator.is_leader:
@@ -197,8 +258,27 @@ def add_mesh_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     
     up_parser.add_argument(
+        "--mode",
+        choices=["host", "worker", "auto"],
+        default="auto",
+        help="Node mode: host (stores models), worker (no models, downloads from host), auto (peer-to-peer)"
+    )
+    
+    up_parser.add_argument(
+        "--host-ip",
+        help="IP address of the host node (required for worker mode if not using auto-discovery)",
+        type=str,
+    )
+    
+    up_parser.add_argument(
         "--ip",
-        help="IP address of a known peer to connect to (optional, auto-discovery used if not provided)",
+        help="IP address of any peer to connect to (for auto-discovery bypass)",
+        type=str,
+    )
+    
+    up_parser.add_argument(
+        "--model-path",
+        help="Path to model file (required for host mode to serve models)",
         type=str,
     )
     
