@@ -158,13 +158,21 @@ class MeshDashboard:
         
     async def index(self, request: web.Request) -> web.Response:
         """Serve main dashboard page."""
+        template_dir = Path(__file__).parent / "templates"
+        template_file = template_dir / "index.html"
+        
+        logger.debug(f"Template dir: {template_dir}, exists: {template_dir.exists()}")
+        logger.debug(f"Template file: {template_file}, exists: {template_file.exists()}")
+        
         try:
             context = {
                 "node_id": self.coordinator.node_id,
                 "node_name": self.coordinator.node_name,
                 "is_leader": self.coordinator.is_leader,
             }
-            return aiohttp_jinja2.render_template("index.html", request, context)
+            response = aiohttp_jinja2.render_template("index.html", request, context)
+            logger.debug("Template rendered successfully")
+            return response
         except Exception as e:
             logger.error(f"Template render error: {e}")
             # Return simple HTML as fallback
@@ -172,12 +180,16 @@ class MeshDashboard:
                 text=f"""
 <!DOCTYPE html>
 <html>
-<head><title>Miniforge Mesh</title></head>
+<head>
+    <title>Miniforge Mesh - {self.coordinator.node_name}</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
 <body>
     <h1>Miniforge Mesh - {self.coordinator.node_name}</h1>
     <p>Node ID: {self.coordinator.node_id}</p>
     <p>Leader: {self.coordinator.is_leader}</p>
-    <p><a href="/static/index.html">Try static fallback</a></p>
+    <p style="color: red;">Template error: {e}</p>
+    <p><a href="/static/fallback.html">Try static fallback</a></p>
 </body>
 </html>
 """,
