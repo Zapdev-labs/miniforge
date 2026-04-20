@@ -46,22 +46,19 @@ class MeshDashboard:
         self.sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins="*")
         self.sio.attach(self.app)
         
-        # Setup templates - use PackageLoader for better compatibility
-        template_dir = Path(__file__).parent / "static"
-        try:
-            # Try FileSystemLoader first
-            env = aiohttp_jinja2.setup(
-                self.app,
-                loader=jinja2.FileSystemLoader(str(template_dir)),
-                context_processors=[aiohttp_jinja2.request_processor],
-            )
-            # Add global url function
-            env.globals['url'] = lambda name, **kwargs: f"/static/{kwargs.get('filename', '')}"
-        except Exception as e:
-            logger.warning(f"Jinja2 setup warning: {e}")
+        # Setup templates
+        template_dir = Path(__file__).parent / "templates"
+        static_dir = Path(__file__).parent / "static"
         
-        # Store template dir for fallback
-        self._template_dir = template_dir
+        # Ensure directories exist
+        template_dir.mkdir(exist_ok=True)
+        static_dir.mkdir(exist_ok=True)
+        
+        # Setup Jinja2 with FileSystemLoader
+        aiohttp_jinja2.setup(
+            self.app,
+            loader=jinja2.FileSystemLoader(str(template_dir)),
+        )
         
         # State
         self._site: Optional[web.TCPSite] = None
@@ -76,17 +73,24 @@ class MeshDashboard:
         
     def _setup_routes(self) -> None:
         """Setup HTTP routes."""
-        # Static files must be added BEFORE template routes
         static_dir = Path(__file__).parent / "static"
-        self.app.router.add_static("/static", static_dir, name="static")
         
-        # API routes
+        # API routes first
         self.app.router.add_get("/api/status", self.api_status)
         self.app.router.add_post("/api/chat", self.api_chat)
         self.app.router.add_get("/api/nodes", self.api_nodes)
         self.app.router.add_post("/api/connect", self.api_connect)
         
-        # Main page - must be last to not conflict with static
+        # Static files - named route for url() function
+        if static_dir.exists():
+            self.app.router.add_static(
+                "/static", 
+                static_dir, 
+                name="static",
+                append_version=True,
+            )
+        
+        # Main page route (must be last)
         self.app.router.add_get("/", self.index)
         
     def _setup_socketio(self) -> None:
