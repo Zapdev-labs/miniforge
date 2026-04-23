@@ -19,7 +19,7 @@ High-performance Python library for MiniMax M2.7 inference, optimized for GMKtec
 uv pip install -e .
 
 # Or install from source
-git clone <repo>
+git clone https://github.com/Zapdev-labs/miniforge.git
 cd miniforge
 uv pip install -e ".[all]"
 ```

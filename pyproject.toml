@@ -1,6 +1,6 @@
 [project]
 name = "miniforge"
-version = "0.1.0"
+version = "0.1.1"
 description = "High-performance MiniMax M2.7 inference library optimized for GMKtech M7"
 readme = "README.md"
 license = {text = "MIT"}
@@ -57,9 +57,9 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/user/miniforge"
-Repository = "https://github.com/user/miniforge"
-Issues = "https://github.com/user/miniforge/issues"
+Homepage = "https://github.com/Zapdev-labs/miniforge"
+Repository = "https://github.com/Zapdev-labs/miniforge"
+Issues = "https://github.com/Zapdev-labs/miniforge/issues"
 
 [project.scripts]
 miniforge = "miniforge.cli:main"
