@@ -662,6 +662,29 @@ ALL_MODELS = {
         max_context=262_144,
         is_moe=True,
     ),
+    # Kimi K2.6: Successor to K2.5 — 1T+ param MoE, 384+ experts, extended context.
+    "moonshotai/Kimi-K2.6": ModelInfo(
+        id="moonshotai/Kimi-K2.6",
+        params_billions=1000.0,
+        default_quantization="UD-TQ1_0",
+        description="Kimi K2.6 — 1T+ MoE. Successor to K2.5 with improved reasoning and up to 256K context.",
+        tags=["reasoning", "chat", "vision", "tools", "moe"],
+        vision=True,
+        tools=True,
+        max_context=256_000,
+        is_moe=True,
+    ),
+    "unsloth/Kimi-K2.6-GGUF": ModelInfo(
+        id="unsloth/Kimi-K2.6-GGUF",
+        params_billions=1000.0,
+        default_quantization="UD-TQ1_0",
+        description="Kimi K2.6 GGUF via Unsloth — 1T+ MoE. UD-TQ1_0 ≈ 240 GB on disk.",
+        tags=["reasoning", "chat", "vision", "tools", "moe"],
+        vision=True,
+        tools=True,
+        max_context=256_000,
+        is_moe=True,
+    ),
 }
 
 

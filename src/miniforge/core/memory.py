@@ -26,22 +26,17 @@ class MemoryStats:
 
 class MemoryManager:
     """
-    Manages memory allocation for the GMKtech M7 constraint (28GB total).
+    Manages memory allocation dynamically based on actual system RAM.
 
-    Key constraints:
-    - 28GB total system RAM (4GB allocated to VRAM)
-    - 4GB reserved for OS and WSL2 overhead
-    - 24GB available for model inference
+    Auto-detects total RAM and reserves headroom for the OS.
+    No longer hardcoded to the GMKtech M7 28GB constraint.
     """
 
-    # Hardware limits
-    TOTAL_RAM_GB = 28.0
+    # Default OS reserve — scales with total RAM on init
     RESERVE_OS_GB = 4.0
-    MAX_AVAILABLE_GB = TOTAL_RAM_GB - RESERVE_OS_GB  # 24GB
 
     # Safety margins
-    SAFETY_FACTOR = 0.85  # Use only 85% of available to avoid OOM
-    MAX_USABLE_GB = MAX_AVAILABLE_GB * SAFETY_FACTOR  # ~20.4GB
+    SAFETY_FACTOR = 0.90  # Use up to 90% of available RAM
 
     def __init__(self, target_utilization: Optional[float] = None):
         """
@@ -50,10 +45,16 @@ class MemoryManager:
         Args:
             target_utilization: Override default safety factor (0.0-1.0)
         """
+        import psutil
+
+        self.total_ram_gb = psutil.virtual_memory().total / (1024**3)
+        self.reserve_os_gb = max(4.0, self.total_ram_gb * 0.10)
+        self.max_available_gb = self.total_ram_gb - self.reserve_os_gb
+
         if target_utilization:
-            self.max_usable_gb = self.MAX_AVAILABLE_GB * target_utilization
+            self.max_usable_gb = self.max_available_gb * target_utilization
         else:
-            self.max_usable_gb = self.MAX_USABLE_GB
+            self.max_usable_gb = self.max_available_gb * self.SAFETY_FACTOR
 
         self.current_model_memory = 0.0
         self.current_kv_memory = 0.0

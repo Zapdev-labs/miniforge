@@ -5,11 +5,13 @@ from pathlib import Path
 import asyncio
 import logging
 
+import psutil
+
 from miniforge.core.engine import InferenceEngine
 from miniforge.core.memory import MemoryManager
 from miniforge.models.gguf_convert import auto_convert_safetensors_to_gguf
 from miniforge.models.registry import get_registry
-from miniforge.utils.config import M7Config, load_config
+from miniforge.utils.config import M7Config
 from miniforge.generation.tools import Tool, ToolExecutor
 from miniforge.multimodal.vision import VisionProcessor
 
@@ -50,14 +52,14 @@ class Miniforge:
             config: Configuration object
             backend: Override backend (llama_cpp or transformers)
         """
-        self.config = config or load_config()
+        self.config = config or M7Config.auto()
         self.model_path = model_path or self.DEFAULT_MODEL
         self.backend_name = backend or self.config.backend
 
         self._engine: Optional[InferenceEngine] = None
-        self._memory_manager = MemoryManager(
-            target_utilization=self.config.max_memory_gb / MemoryManager.TOTAL_RAM_GB
-        )
+        total_ram = psutil.virtual_memory().total / (1024**3)
+        target_util = self.config.max_memory_gb / total_ram if total_ram > 0 else 0.9
+        self._memory_manager = MemoryManager(target_utilization=target_util)
         self._registry = get_registry(self.config.cache_dir)
         self._tool_executor: Optional[ToolExecutor] = None
         self._vision_processor: Optional[VisionProcessor] = None
@@ -91,7 +93,7 @@ class Miniforge:
         """
         # Create or update config with cache_dir / download_dir
         if config is None:
-            config = load_config()
+            config = M7Config.auto()
         if cache_dir is not None:
             config.cache_dir = cache_dir
         # download_dir overrides where GGUF files land (e.g. "D:/AI" for large models)
@@ -130,9 +132,7 @@ class Miniforge:
 
         # Resolve download directory: explicit arg > config field > registry gguf_dir default
         gguf_download_dir = (
-            Path(download_dir).expanduser()
-            if download_dir
-            else self._registry.gguf_dir
+            Path(download_dir).expanduser() if download_dir else self._registry.gguf_dir
         )
         gguf_download_dir.mkdir(parents=True, exist_ok=True)
 
@@ -169,8 +169,9 @@ class Miniforge:
             "QwQ-32B": 64,
             "Qwen2.5-VL": 64,
             "Qwen2.5-Coder": 64,
-            # Kimi K2.5
+            # Kimi K2 series (K2.5 / K2.6)
             "Kimi-K2.5": 64,
+            "Kimi-K2.6": 64,
         }
 
         def get_n_layers(model_id: str) -> int:
@@ -199,10 +200,18 @@ class Miniforge:
 
                 # Estimate GGUF disk size from param count + quant ratio
                 quant_bpw = {
-                    "UD-TQ1_0": 1.0, "UD-IQ1_S": 1.1, "UD-IQ1_M": 1.2,
-                    "UD-IQ2_XXS": 2.06, "UD-IQ2_M": 2.3, "Q2_K": 2.5,
-                    "UD-IQ3_XXS": 3.0, "Q3_K_M": 3.4,
-                    "Q4_K_M": 4.5, "Q5_K_M": 5.5, "Q6_K": 6.5, "Q8_0": 8.0,
+                    "UD-TQ1_0": 1.0,
+                    "UD-IQ1_S": 1.1,
+                    "UD-IQ1_M": 1.2,
+                    "UD-IQ2_XXS": 2.06,
+                    "UD-IQ2_M": 2.3,
+                    "Q2_K": 2.5,
+                    "UD-IQ3_XXS": 3.0,
+                    "Q3_K_M": 3.4,
+                    "Q4_K_M": 4.5,
+                    "Q5_K_M": 5.5,
+                    "Q6_K": 6.5,
+                    "Q8_0": 8.0,
                 }
                 bpw = quant_bpw.get(quantization or self.config.quantization, 2.5)
                 disk_gb = (params * 1e9 * bpw) / (8 * 1024**3)
@@ -250,10 +259,13 @@ class Miniforge:
             else:
                 quantization = self._memory_manager.select_quantization(params)
 
+        # Check if model_id is a local path first
+        local_path = Path(model_id).expanduser()
+        if local_path.exists():
+            logger.info(f"Using local model path: {local_path}")
+            model_path = local_path
         # Check cache for GGUF
-        cached_path = self._registry.get_cached_gguf_path(model_id, quantization)
-
-        if cached_path:
+        elif cached_path := self._registry.get_cached_gguf_path(model_id, quantization):
             logger.info(f"Using cached GGUF: {cached_path}")
             model_path = cached_path
         elif self.backend_name == "llama_cpp":
@@ -353,9 +365,7 @@ class Miniforge:
                                     if not q_try:
                                         continue
                                     matching = sorted(
-                                        f
-                                        for f in all_files
-                                        if f.endswith(".gguf") and q_try in f
+                                        f for f in all_files if f.endswith(".gguf") and q_try in f
                                     )
                                     if matching:
                                         gguf_files = matching

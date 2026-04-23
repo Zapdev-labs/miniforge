@@ -11,8 +11,6 @@ API_HOST="${MINIFORGE_HOST:-0.0.0.0}"
 MODEL="${MINIFORGE_MODEL:-MiniMaxAI/MiniMax-M2.7}"
 BACKEND="${MINIFORGE_BACKEND:-llama_cpp}"
 QUANTIZATION="${MINIFORGE_QUANTIZATION:-}"
-CONFIG="${MINIFORGE_CONFIG:-}"
-AUTO_HW="${MINIFORGE_AUTO_HW:-1}"
 
 cd "$SCRIPT_DIR"
 
@@ -58,9 +56,7 @@ fi
 # Export env vars for the API server
 export MINIFORGE_MODEL="$MODEL"
 export MINIFORGE_BACKEND="$BACKEND"
-export MINIFORGE_AUTO_HW="$AUTO_HW"
 [ -n "$QUANTIZATION" ] && export MINIFORGE_QUANTIZATION="$QUANTIZATION"
-[ -n "$CONFIG" ] && export MINIFORGE_CONFIG="$CONFIG"
 
 echo ""
 echo "[3/5] Starting Miniforge API server..."
