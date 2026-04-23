@@ -662,6 +662,33 @@ ALL_MODELS = {
         max_context=262_144,
         is_moe=True,
     ),
+    # ============================================================================
+    # Transferred Local Models (192.168.1.46 - miniforge server)
+    # ============================================================================
+    # MiniMax-M2.7-161B-REAP-Q3_K_M: 73GB single-file GGUF (transferred to remote)
+    "local/MiniMax-M2.7-161B-REAP-Q3_K_M": ModelInfo(
+        id="local/MiniMax-M2.7-161B-REAP-Q3_K_M",
+        params_billions=161.0,
+        default_quantization="Q3_K_M",
+        description="MiniMax-M2.7-161B-REAP at Q3_K_M — 73GB. Pruned 161B MoE, higher quality than Q2_K.",
+        tags=["pruned", "moe", "tools", "reasoning"],
+        vision=False,
+        tools=True,
+        max_context=196_608,
+        is_moe=True,
+    ),
+    # Kimi-K2.5-UD-TQ1_0: 224GB 5-shard GGUF (transferred to remote)
+    "local/Kimi-K2.5-UD-TQ1_0": ModelInfo(
+        id="local/Kimi-K2.5-UD-TQ1_0",
+        params_billions=1000.0,
+        default_quantization="UD-TQ1_0",
+        description="Kimi-K2.5 1T MoE at UD-TQ1_0 — 224GB, 5 shards. Ultra-high quality quantization.",
+        tags=["reasoning", "chat", "vision", "tools", "moe"],
+        vision=True,
+        tools=True,
+        max_context=262_144,
+        is_moe=True,
+    ),
 }
 
 
