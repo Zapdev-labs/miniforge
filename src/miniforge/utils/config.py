@@ -1,84 +1,123 @@
-"""Configuration management for Miniforge."""
+"""Configuration management for Miniforge.
 
-from typing import Any, Dict, Optional, Union
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
-import os
-import sys
-import yaml
+Auto-detects hardware on first use. Users can override any field manually
+or pick a performance preset. Environment overrides are supported so the CLI,
+server, and WebUI share the same runtime configuration model.
+"""
+
+from __future__ import annotations
+
 import logging
+import os
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_ID = "MiniMaxAI/MiniMax-M2.7"
+VALID_PRESETS = ("speed", "balanced", "memory", "quality", "moe")
+
+
+def _read_bool_env(name: str) -> bool | None:
+    """Parse a boolean environment variable when present."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    logger.warning("Ignoring invalid boolean env var %s=%r", name, value)
+    return None
+
+
+def _read_int_env(name: str) -> int | None:
+    """Parse an integer environment variable when present."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid integer env var %s=%r", name, value)
+        return None
+
+
+def _read_float_env(name: str) -> float | None:
+    """Parse a float environment variable when present."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Ignoring invalid float env var %s=%r", name, value)
+        return None
 
 
 @dataclass
 class M7Config:
-    """
-    Configuration optimized for GMKtech M7 hardware.
+    """Inference configuration — auto-detected by default, overridable field-by-field."""
 
-    Defaults tuned for:
-    - AMD Ryzen 7 PRO 6850H (8 cores)
-    - 28GB total RAM (4GB to VRAM)
-    - CPU-only inference with llama.cpp
-    """
-
-    # Hardware limits
-    max_memory_gb: float = 24.0  # Leave 4GB for OS
+    # Hardware limits (auto-detected from actual RAM)
+    max_memory_gb: float = 24.0
     reserve_memory_gb: float = 4.0
 
     # CPU settings
-    n_threads: int = 8  # Physical cores - Ryzen 7 PRO 6850H
-    n_batch: int = 2048  # Increased for better throughput with 192K context
-    n_ubatch: int = 512  # Micro-batch size for processing
-    cpu_mask: str = "0-7"  # CPU affinity mask (e.g., "0-7" for cores 0-7)
-    cpu_strict: bool = False  # Strict CPU pinning (may improve cache locality)
-    priority: str = "normal"  # Thread priority: "normal", "realtime", "high"
+    n_threads: int = 8
+    n_batch: int = 2048
+    n_ubatch: int = 512
+    cpu_mask: str = "0-7"
+    cpu_strict: bool = False
+    priority: str = "normal"
 
     # CPU ISA extensions (auto-detected if None)
-    use_avx: Optional[bool] = None
-    use_avx2: Optional[bool] = None
-    use_avx512: Optional[bool] = None
-    use_fma: Optional[bool] = None
-    use_f16c: Optional[bool] = None
+    use_avx: bool | None = None
+    use_avx2: bool | None = None
+    use_avx512: bool | None = None
+    use_fma: bool | None = None
+    use_f16c: bool | None = None
 
     # Model settings
     model_id: str = DEFAULT_MODEL_ID
-    model_weights_path: Optional[str] = None
-    n_ctx: int = 194_560  # Full 192K context minus safety headroom (196608 - 2048)
-    quantization: str = "UD-IQ2_XXS"  # Default for MiniMax M2.7 228B MoE on 28GB
+    model_weights_path: str | None = None
+    n_ctx: int = 194_560
+    quantization: str = "UD-IQ2_XXS"
 
     # KV cache compression
-    # q4_0 halves KV memory vs q8_0, widely supported in llama-cpp.
-    # AirLLM-style context sizing will auto-calculate max context for available RAM.
     cache_type_k: str = "q4_0"
     cache_type_v: str = "q4_0"
 
     # Advanced KV cache settings
-    cache_quantization_group: int = 128  # KV cache quantization group size
-    cache_mixed_precision: bool = True  # Allow per-layer KV cache quantization
+    cache_quantization_group: int = 128
+    cache_mixed_precision: bool = True
 
-    # Speculative decoding (draft model acceleration)
-    speculative_n_max: int = 16  # Max draft tokens to speculatively decode
-    speculative_n_min: int = 5   # Min draft tokens for speculative mode
-    speculative_p_min: float = 0.8  # Min acceptance probability to continue drafting
+    # Speculative decoding
+    speculative_n_max: int = 16
+    speculative_n_min: int = 5
+    speculative_p_min: float = 0.8
 
-    # GPU offloading (for AMD Radeon 680M iGPU)
-    n_gpu_layers: int = 0  # Set to 15-20 to offload some layers to 4GB VRAM
-    main_gpu: int = 0  # Primary GPU device
-    tensor_split: Optional[list[float]] = None  # For multi-GPU setups
+    # GPU offloading
+    n_gpu_layers: int = 0
+    main_gpu: int = 0
+    tensor_split: list[float] | None = None
 
     # Performance features
     flash_attn: bool = True
     use_mmap: bool = True
-    use_mlock: bool = False  # WSL2 doesn't support mlock
-    rope_scaling_type: Optional[str] = "linear"  # For long context scaling
-    rope_freq_base: float = 10000.0  # Default RoPE base frequency
-    rope_freq_scale: float = 1.0  # RoPE scaling factor (1.0 = no scaling)
+    use_mlock: bool = False
+    rope_scaling_type: str | None = "linear"
+    rope_freq_base: float = 10000.0
+    rope_freq_scale: float = 1.0
 
     # Backend selection
-    backend: str = "llama_cpp"  # llama_cpp or transformers
+    backend: str = "llama_cpp"
 
     # Generation defaults
     default_max_tokens: int = 512
@@ -92,13 +131,13 @@ class M7Config:
     enable_streaming: bool = True
 
     # Paths
-    cache_dir: Optional[str] = None
-    download_dir: Optional[str] = None  # Override where GGUF shards are downloaded (e.g. "D:/AI")
-    llama_cpp_path: Optional[str] = None
+    cache_dir: str | None = None
+    download_dir: str | None = None
+    llama_cpp_path: str | None = None
 
     # Per-model overrides (set automatically from registry, or manually)
-    max_model_ctx: Optional[int] = None  # Model's trained context ceiling (e.g. 262144 for Kimi K2.5)
-    is_moe: bool = False  # Mixture-of-Experts: forces mmap=True, mlock=False, caps default n_ctx
+    max_model_ctx: int | None = None
+    is_moe: bool = False
 
     # Logging
     verbose: bool = False
@@ -107,30 +146,59 @@ class M7Config:
     def __post_init__(self):
         """Validate configuration."""
         if self.n_ctx < 512:
-            logger.warning(f"Context window {self.n_ctx} very small, minimum 512 recommended")
+            logger.warning("Context window %s very small, minimum 512 recommended", self.n_ctx)
 
         valid_quants = [
-            # Standard GGUF quants
-            "Q2_K", "Q3_K", "Q3_K_S", "Q3_K_M", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "F16",
-            # Unsloth UD-* quants (1-bit through 8-bit)
-            "UD-TQ1_0", "UD-IQ1_S", "UD-IQ1_M",
-            "UD-IQ2_XXS", "UD-IQ2_M", "UD-Q2_K_XL",
-            "UD-IQ3_XXS", "UD-IQ3_S", "UD-IQ3_K_S", "UD-Q3_K_M", "UD-Q3_K_XL",
-            "UD-IQ4_XS", "UD-Q4_K_S", "MXFP4_MOE", "UD-Q4_NL", "UD-Q4_K_M", "UD-Q4_K_XL",
-            "UD-Q5_K_S", "UD-Q5_K_M", "UD-Q5_K_XL",
-            "UD-Q6_K", "UD-Q6_K_XL", "UD-Q8_K_XL", "BF16",
+            "Q2_K",
+            "Q3_K",
+            "Q3_K_S",
+            "Q3_K_M",
+            "Q4_K_M",
+            "Q5_K_M",
+            "Q6_K",
+            "Q8_0",
+            "F16",
+            "UD-TQ1_0",
+            "UD-IQ1_S",
+            "UD-IQ1_M",
+            "UD-IQ2_XXS",
+            "UD-IQ2_M",
+            "UD-Q2_K_XL",
+            "UD-IQ3_XXS",
+            "UD-IQ3_S",
+            "UD-IQ3_K_S",
+            "UD-Q3_K_M",
+            "UD-Q3_K_XL",
+            "UD-IQ4_XS",
+            "UD-Q4_K_S",
+            "MXFP4_MOE",
+            "UD-Q4_NL",
+            "UD-Q4_K_M",
+            "UD-Q4_K_XL",
+            "UD-Q5_K_S",
+            "UD-Q5_K_M",
+            "UD-Q5_K_XL",
+            "UD-Q6_K",
+            "UD-Q6_K_XL",
+            "UD-Q8_K_XL",
+            "BF16",
         ]
         if self.quantization not in valid_quants:
-            logger.warning(f"Unknown quantization {self.quantization}, using Q4_K_M")
+            logger.warning("Unknown quantization %s, using Q4_K_M", self.quantization)
             self.quantization = "Q4_K_M"
 
         valid_backends = ["llama_cpp", "transformers"]
         if self.backend not in valid_backends:
-            logger.warning(f"Unknown backend {self.backend}, using llama_cpp")
+            logger.warning("Unknown backend %s, using llama_cpp", self.backend)
             self.backend = "llama_cpp"
 
     @classmethod
-    def performance_preset(cls, preset: str = "balanced") -> "M7Config":
+    def auto(cls, model_params_b: float = 2.7, is_moe: bool = False) -> M7Config:
+        """Auto-detect hardware and return a tuned config."""
+        return cls.from_hardware(model_params_b=model_params_b, is_moe=is_moe)
+
+    @classmethod
+    def performance_preset(cls, preset: str = "balanced") -> M7Config:
         """Create a config optimized for a specific performance profile.
 
         Presets:
@@ -140,6 +208,10 @@ class M7Config:
             - "quality": Best output quality, no compression
             - "moe": Optimized for Mixture-of-Experts models
         """
+        if preset not in VALID_PRESETS:
+            logger.warning("Unknown preset %s, using balanced", preset)
+            preset = "balanced"
+
         config = cls()
 
         if preset == "speed":
@@ -170,7 +242,7 @@ class M7Config:
             config.n_batch = 1024
             config.cache_type_k = "f16"
             config.cache_type_v = "f16"
-            config.flash_attn = False  # May affect precision slightly
+            config.flash_attn = False
             config.quantization = "Q8_0"
         elif preset == "moe":
             config.n_threads = 16
@@ -186,39 +258,109 @@ class M7Config:
         return config
 
     @classmethod
-    def from_yaml(cls, path: Union[str, Path]) -> "M7Config":
-        """Load configuration from YAML file."""
-        path = Path(path)
+    def from_env(cls, base: M7Config | None = None) -> M7Config:
+        """Build a config from environment variables layered over auto config."""
+        preset = os.environ.get("MINIFORGE_PRESET")
+        if base is None:
+            config = cls.performance_preset(preset) if preset else cls.auto()
+        else:
+            config = base
 
-        if not path.exists():
-            # Return default config
-            logger.info(f"Config file not found at {path}, using defaults")
-            return cls()
+        config.apply_overrides(
+            model_id=os.environ.get("MINIFORGE_MODEL"),
+            backend=os.environ.get("MINIFORGE_BACKEND"),
+            quantization=os.environ.get("MINIFORGE_QUANTIZATION"),
+            download_dir=os.environ.get("MINIFORGE_DOWNLOAD_DIR"),
+            cache_dir=os.environ.get("MINIFORGE_CACHE_DIR"),
+            log_level=os.environ.get("MINIFORGE_LOG_LEVEL"),
+            n_ctx=_read_int_env("MINIFORGE_N_CTX"),
+            n_threads=_read_int_env("MINIFORGE_N_THREADS"),
+            max_tokens=_read_int_env("MINIFORGE_MAX_TOKENS"),
+            temperature=_read_float_env("MINIFORGE_TEMPERATURE"),
+            top_p=_read_float_env("MINIFORGE_TOP_P"),
+            verbose=_read_bool_env("MINIFORGE_VERBOSE"),
+        )
+        return config
 
-        with open(path) as f:
-            data = yaml.safe_load(f)
+    @classmethod
+    def from_hardware(
+        cls,
+        model_params_b: float = 2.7,
+        is_moe: bool = False,
+    ) -> M7Config:
+        """Create a configuration auto-tuned to the current hardware."""
+        from miniforge.utils.hardware import auto_config, detect_hardware
 
-        # Filter to only valid fields
-        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
-        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        profile = detect_hardware()
+        settings = auto_config(model_params_b=model_params_b, is_moe=is_moe, profile=profile)
+        return cls(**settings)
 
-        return cls(**filtered_data)
-
-    def to_yaml(self, path: Union[str, Path]) -> None:
-        """Save configuration to YAML file."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(path, "w") as f:
-            yaml.dump(asdict(self), f, default_flow_style=False)
-
-        logger.info(f"Configuration saved to {path}")
-
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return asdict(self)
 
-    def get_backend_config(self) -> Dict[str, Any]:
+    def apply_overrides(
+        self,
+        *,
+        model_id: str | None = None,
+        backend: str | None = None,
+        quantization: str | None = None,
+        download_dir: str | None = None,
+        cache_dir: str | None = None,
+        log_level: str | None = None,
+        n_ctx: int | None = None,
+        n_threads: int | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        verbose: bool | None = None,
+    ) -> M7Config:
+        """Apply non-None overrides in place and return the config."""
+        if model_id is not None:
+            self.model_id = model_id
+        if backend is not None:
+            self.backend = backend
+        if quantization is not None:
+            self.quantization = quantization
+        if download_dir is not None:
+            self.download_dir = download_dir
+        if cache_dir is not None:
+            self.cache_dir = cache_dir
+        if log_level is not None:
+            self.log_level = log_level
+        if n_ctx is not None:
+            self.n_ctx = n_ctx
+        if n_threads is not None:
+            self.n_threads = n_threads
+        if max_tokens is not None:
+            self.default_max_tokens = max_tokens
+        if temperature is not None:
+            self.default_temperature = temperature
+        if top_p is not None:
+            self.default_top_p = top_p
+        if verbose is not None:
+            self.verbose = verbose
+
+        self.__post_init__()
+        return self
+
+    def summary(self) -> dict[str, Any]:
+        """Return a compact runtime summary for UX surfaces."""
+        return {
+            "model_id": self.model_id,
+            "backend": self.backend,
+            "quantization": self.quantization,
+            "n_ctx": self.n_ctx,
+            "n_threads": self.n_threads,
+            "cache_type_k": self.cache_type_k,
+            "cache_type_v": self.cache_type_v,
+            "flash_attn": self.flash_attn,
+            "download_dir": self.download_dir,
+            "cache_dir": self.cache_dir,
+            "generation": self.get_generation_defaults(),
+        }
+
+    def get_backend_config(self) -> dict[str, Any]:
         """Get backend-specific configuration."""
         config = {
             "n_ctx": self.n_ctx,
@@ -233,12 +375,10 @@ class M7Config:
             "verbose": self.verbose,
             "n_gpu_layers": self.n_gpu_layers,
             "main_gpu": self.main_gpu,
-            # Performance optimizations
             "cpu_mask": self.cpu_mask,
             "cpu_strict": self.cpu_strict,
             "priority": self.priority,
         }
-        # CPU ISA extensions (only if explicitly set)
         if self.use_avx is not None:
             config["use_avx"] = self.use_avx
         if self.use_avx2 is not None:
@@ -261,7 +401,7 @@ class M7Config:
             config["is_moe"] = True
         return config
 
-    def get_generation_defaults(self) -> Dict[str, Any]:
+    def get_generation_defaults(self) -> dict[str, Any]:
         """Get default generation parameters."""
         return {
             "max_tokens": self.default_max_tokens,
@@ -270,66 +410,8 @@ class M7Config:
             "top_k": self.default_top_k,
         }
 
-    def resolved_model_weights_dir(self) -> Optional[Path]:
-        """If set, weights are stored and loaded only from this folder (no duplicate hub cache)."""
+    def resolved_model_weights_dir(self) -> Path | None:
+        """If set, weights are stored and loaded only from this folder."""
         if not self.model_weights_path:
             return None
         return Path(self.model_weights_path).expanduser()
-
-
-def _default_config_dir() -> Path:
-    """
-    Return the platform-appropriate config directory for miniforge.
-
-    - Windows: %APPDATA%\\miniforge  (e.g. C:\\Users\\you\\AppData\\Roaming\\miniforge)
-    - Other:   ~/.config/miniforge
-    """
-    if sys.platform == "win32":
-        appdata = os.environ.get("APPDATA")
-        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-        return base / "miniforge"
-    return Path.home() / ".config" / "miniforge"
-
-
-def load_config(config_path: Optional[Union[str, Path]] = None) -> M7Config:
-    """
-    Load configuration from file or return defaults.
-
-    Searches in order:
-    1. Provided path
-    2. Platform config dir (Windows: %APPDATA%\\miniforge\\config.yaml, other: ~/.config/miniforge/config.yaml)
-    3. ~/.config/miniforge/config.yaml  (always checked as fallback on all platforms)
-    4. ./miniforge.yaml
-    5. Default configuration
-    """
-    if config_path:
-        return M7Config.from_yaml(config_path)
-
-    # Search paths — platform dir first so Windows users find it at a sensible location
-    search_paths = [
-        _default_config_dir() / "config.yaml",
-        Path.home() / ".config" / "miniforge" / "config.yaml",
-        Path("miniforge.yaml"),
-        Path("config.yaml"),
-    ]
-
-    for path in search_paths:
-        if path.exists():
-            logger.info("Loaded config from %s", path)
-            return M7Config.from_yaml(path)
-
-    return M7Config()
-
-
-def create_default_config_file(path: Optional[Union[str, Path]] = None) -> Path:
-    """Create a default configuration file at the platform-appropriate location."""
-    if path is None:
-        path = _default_config_dir() / "config.yaml"
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    config = M7Config()
-    config.to_yaml(path)
-
-    return path

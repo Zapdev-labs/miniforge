@@ -1,7 +1,6 @@
 """Test core functionality."""
 
 import pytest
-from pathlib import Path
 
 from miniforge.core.memory import MemoryManager, MemoryStats
 from miniforge.utils.config import M7Config
@@ -11,9 +10,9 @@ def test_memory_manager_initialization():
     """Test memory manager initialization."""
     mem = MemoryManager()
 
-    # Should have correct limits for M7
-    assert mem.TOTAL_RAM_GB == 28.0
-    assert mem.MAX_AVAILABLE_GB == 24.0
+    # Should expose dynamic machine-aware limits.
+    assert mem.total_ram_gb > 0
+    assert mem.max_available_gb > 0
     assert mem.max_usable_gb > 0
 
 
@@ -58,9 +57,9 @@ def test_m7_config_defaults():
     config = M7Config()
 
     assert config.n_threads == 8
-    assert config.n_ctx == 200_000
-    assert config.quantization == "Q4_K_M"
-    assert config.cache_type_k == "turbo3"
+    assert config.n_ctx == 194_560
+    assert config.quantization == "UD-IQ2_XXS"
+    assert config.cache_type_k == "q4_0"
     assert config.max_memory_gb == 24.0
 
 
@@ -107,12 +106,38 @@ def test_generation_defaults():
     assert defaults["temperature"] == 0.7
 
 
+def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Environment overrides should layer onto the resolved config."""
+    monkeypatch.setenv("MINIFORGE_PRESET", "memory")
+    monkeypatch.setenv("MINIFORGE_MODEL", "acme/test-model")
+    monkeypatch.setenv("MINIFORGE_BACKEND", "transformers")
+    monkeypatch.setenv("MINIFORGE_MAX_TOKENS", "1024")
+    monkeypatch.setenv("MINIFORGE_TEMPERATURE", "0.4")
+
+    config = M7Config.from_env()
+
+    assert config.model_id == "acme/test-model"
+    assert config.backend == "transformers"
+    assert config.default_max_tokens == 1024
+    assert config.default_temperature == 0.4
+    assert config.quantization == "UD-IQ2_XXS"
+
+
+def test_config_summary() -> None:
+    """Runtime summary should expose the user-visible config surface."""
+    config = M7Config(model_id="demo/model", backend="transformers")
+
+    summary = config.summary()
+
+    assert summary["model_id"] == "demo/model"
+    assert summary["backend"] == "transformers"
+    assert summary["generation"]["max_tokens"] == config.default_max_tokens
+
+
 @pytest.mark.asyncio
 async def test_engine_initialization_mock():
     """Mock test for engine initialization."""
     # This would require actual model files to test fully
     # For now, just test the config passes through
-    from miniforge.core.engine import InferenceEngine
-
     # Can't test without model, but can verify structure
     pass

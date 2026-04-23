@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Miniforge WebUI</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">M</div>
+        <div class="sidebar-title">Miniforge</div>
+      </div>
+      <button class="new-chat-btn" id="newChatBtn">+ New Chat</button>
+      <div class="conversation-list" id="conversationList"></div>
+      <div class="sidebar-footer">
+        <div id="statusText">Loading...</div>
+        <div id="statusMeta" class="status-meta">Connecting to runtime</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <div style="display:flex;align-items:center;">
+          <button class="icon-btn menu-toggle" id="menuToggle" title="Menu">&#9776;</button>
+          <select class="model-select" id="modelSelect">
+            <option value="miniforge">MiniMax M2.7</option>
+          </select>
+        </div>
+        <div class="topbar-actions">
+          <div class="runtime-pill" id="runtimePill">Loading</div>
+          <button class="icon-btn" id="settingsBtn" title="Settings">&#9881;</button>
+          <button class="icon-btn" id="clearBtn" title="Clear chat">&#128465;</button>
+        </div>
+      </div>
+
+      <div class="runtime-banner" id="runtimeBanner">
+        <div>
+          <strong id="runtimeModel">MiniMax M2.7</strong>
+          <span id="runtimeDetails">Detecting runtime configuration</span>
+        </div>
+      </div>
+
+      <div class="chat-container" id="chatContainer">
+        <div class="welcome" id="welcome">
+          <h1>Miniforge</h1>
+          <p>High-performance local inference. Start typing to chat.</p>
+        </div>
+      </div>
+
+      <div class="input-area">
+        <div class="input-box">
+          <textarea id="messageInput" rows="1" placeholder="Message MiniMax..."></textarea>
+          <button class="send-btn" id="sendBtn" title="Send">&#10148;</button>
+        </div>
+        <div class="input-hint">Enter sends, Shift+Enter adds a new line.</div>
+      </div>
+    </main>
+  </div>
+
+  <div class="modal-overlay" id="settingsModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>Settings</h2>
+        <button class="modal-close" id="closeSettings">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>System Prompt</label>
+          <input type="text" id="systemPrompt" value="You are a helpful assistant.">
+        </div>
+        <div class="form-group">
+          <label>Max Tokens</label>
+          <input type="number" id="maxTokens" value="512" min="1" max="8192">
+        </div>
+        <div class="form-group">
+          <label>Temperature</label>
+          <input type="number" id="temperature" value="1.0" step="0.1" min="0" max="2">
+        </div>
+        <div class="form-group">
+          <label>Top P</label>
+          <input type="number" id="topP" value="0.95" step="0.05" min="0" max="1">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
