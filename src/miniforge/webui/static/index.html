@@ -17,6 +17,7 @@
       <div class="conversation-list" id="conversationList"></div>
       <div class="sidebar-footer">
         <div id="statusText">Loading...</div>
+        <div id="statusMeta" class="status-meta">Connecting to runtime</div>
       </div>
     </aside>
 
@@ -29,8 +30,16 @@
           </select>
         </div>
         <div class="topbar-actions">
+          <div class="runtime-pill" id="runtimePill">Loading</div>
           <button class="icon-btn" id="settingsBtn" title="Settings">&#9881;</button>
           <button class="icon-btn" id="clearBtn" title="Clear chat">&#128465;</button>
+        </div>
+      </div>
+
+      <div class="runtime-banner" id="runtimeBanner">
+        <div>
+          <strong id="runtimeModel">MiniMax M2.7</strong>
+          <span id="runtimeDetails">Detecting runtime configuration</span>
         </div>
       </div>
 
@@ -46,6 +55,7 @@
           <textarea id="messageInput" rows="1" placeholder="Message MiniMax..."></textarea>
           <button class="send-btn" id="sendBtn" title="Send">&#10148;</button>
         </div>
+        <div class="input-hint">Enter sends, Shift+Enter adds a new line.</div>
       </div>
     </main>
   </div>

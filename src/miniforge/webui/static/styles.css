@@ -112,6 +112,11 @@ html, body {
   color: var(--text-secondary);
 }
 
+.status-meta {
+  margin-top: 6px;
+  color: var(--text-secondary);
+}
+
 /* Main */
 .main {
   flex: 1;
@@ -144,6 +149,40 @@ html, body {
   display: flex;
   gap: 8px;
   align-items: center;
+}
+
+.runtime-pill {
+  min-width: 88px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(16, 163, 127, 0.12);
+  border: 1px solid rgba(16, 163, 127, 0.3);
+  color: #7fe5c9;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.runtime-pill.degraded {
+  background: rgba(204, 153, 0, 0.12);
+  border-color: rgba(204, 153, 0, 0.3);
+  color: #f0d48a;
+}
+
+.runtime-banner {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(16, 163, 127, 0.08), rgba(16, 163, 127, 0));
+}
+
+.runtime-banner strong {
+  display: block;
+  font-size: 14px;
+}
+
+.runtime-banner span {
+  color: var(--text-secondary);
+  font-size: 13px;
 }
 
 .icon-btn {
@@ -280,6 +319,12 @@ html, body {
 .send-btn:hover { background: var(--accent-hover); }
 .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+.input-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
 /* Typing indicator */
 .typing {
   display: flex;
@@ -376,4 +421,6 @@ html, body {
   .sidebar.open { transform: translateX(0); }
   .menu-toggle { display: flex; }
   .chat-container, .input-area { padding: 16px 5%; }
+  .runtime-banner { padding: 12px 5%; }
+  .runtime-pill { display: none; }
 }

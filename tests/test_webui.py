@@ -37,9 +37,20 @@ def test_api_stats(client: TestClient) -> None:
     response = client.get("/api/stats")
     assert response.status_code == 200
     data = response.json()
+    assert "status" in data
     assert "uptime_seconds" in data
     assert "memory" in data
     assert "total_gb" in data["memory"]
+
+
+def test_api_runtime(client: TestClient) -> None:
+    """Test runtime endpoint returns resolved config surface."""
+    response = client.get("/api/runtime")
+    assert response.status_code == 200
+    data = response.json()
+    assert "status" in data
+    assert "load_error" in data
+    assert "config" in data
 
 
 def test_metrics_endpoint(client: TestClient) -> None:

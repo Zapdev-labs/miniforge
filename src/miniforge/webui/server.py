@@ -58,6 +58,7 @@ class ServerState:
         self.model: Any | None = None
         self.model_info: dict[str, Any] = {}
         self.config: Any | None = None
+        self.load_error: str | None = None
         self._lock = asyncio.Lock()
         self._generations = 0
         self._total_tokens = 0
@@ -66,39 +67,40 @@ class ServerState:
     async def load(self) -> None:
         """Load model on startup."""
         from miniforge import Miniforge
-        from miniforge.utils.config import M7Config, load_config
+        from miniforge.utils.config import M7Config
 
         model_id = os.environ.get("MINIFORGE_MODEL", "MiniMaxAI/MiniMax-M2.7")
-        config_path = os.environ.get("MINIFORGE_CONFIG")
         quantization = os.environ.get("MINIFORGE_QUANTIZATION")
         backend = os.environ.get("MINIFORGE_BACKEND", "llama_cpp")
-        use_hardware = os.environ.get("MINIFORGE_AUTO_HW", "1") == "1"
+        download_dir = os.environ.get("MINIFORGE_DOWNLOAD_DIR")
 
-        if config_path:
-            config = M7Config.from_yaml(config_path)
-        elif use_hardware:
-            logger.info("Auto-detecting hardware for config...")
-            config = M7Config.from_hardware()
-        else:
-            config = load_config()
+        config = M7Config.from_env()
 
         if quantization:
             config.quantization = quantization
         if backend:
             config.backend = backend
+        if download_dir:
+            config.download_dir = download_dir
+        if model_id:
+            config.model_id = model_id
 
         self.config = config
+        self.load_error = None
 
         logger.info("Loading model %s with backend %s...", model_id, backend)
         self.model = await Miniforge.from_pretrained(
             model_id,
             config=config,
             backend=backend,
+            download_dir=download_dir,
         )
         self.model_info = {
             "id": model_id,
             "object": "model",
             "owned_by": "miniforge",
+            "backend": config.backend,
+            "quantization": config.quantization,
         }
         logger.info("Model loaded successfully.")
 
@@ -128,7 +130,11 @@ class ServerState:
         import psutil
 
         mem = psutil.virtual_memory()
+        config_summary = self.config.summary() if self.config is not None else None
+        healthy = self.model is not None
         return {
+            "status": "healthy" if healthy else "degraded",
+            "load_error": self.load_error,
             "uptime_seconds": round(time.time() - self._start_time, 2),
             "generations": self._generations,
             "total_tokens": self._total_tokens,
@@ -137,6 +143,7 @@ class ServerState:
                 "available_gb": round(mem.available / (1024**3), 2),
                 "percent": mem.percent,
             },
+            "config": config_summary,
             "model": self.model_info,
         }
 
@@ -155,6 +162,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         await _state.load()
     except Exception as exc:
+        _state.load_error = str(exc)
         logger.error("Failed to load model: %s", exc)
         # Continue without model; health endpoint will report degraded
     yield
@@ -193,7 +201,7 @@ def create_app() -> FastAPI:
             ).inc()
         return response
 
-    @app.get("/")
+    @app.get("/", response_model=None)
     async def index() -> FileResponse | dict[str, str]:
         """Serve the main UI page."""
         index_file = static_dir / "index.html"
@@ -206,14 +214,27 @@ def create_app() -> FastAPI:
         """Health check endpoint."""
         healthy = _state.model is not None
         status_code = 200 if healthy else 503
+        config_summary = _state.config.summary() if _state.config is not None else None
         return JSONResponse(
             content={
                 "status": "healthy" if healthy else "degraded",
                 "model_loaded": healthy,
+                "load_error": _state.load_error,
+                "config": config_summary,
                 "timestamp": time.time(),
             },
             status_code=status_code,
         )
+
+    @app.get("/api/runtime")
+    async def api_runtime() -> dict[str, Any]:
+        """Resolved runtime config and server readiness for the frontend."""
+        return {
+            "status": "healthy" if _state.model is not None else "degraded",
+            "load_error": _state.load_error,
+            "model": _state.model_info,
+            "config": _state.config.summary() if _state.config is not None else None,
+        }
 
     @app.get("/api/stats")
     async def api_stats() -> dict[str, Any]:
@@ -228,7 +249,7 @@ def create_app() -> FastAPI:
             "data": [_state.model_info] if _state.model_info else [],
         }
 
-    @app.post("/v1/chat/completions")
+    @app.post("/v1/chat/completions", response_model=None)
     async def chat_completions(
         request: Request,
     ) -> StreamingResponse | JSONResponse | dict[str, Any]:
@@ -414,20 +435,24 @@ def run_server(
     host: str = "0.0.0.0",
     port: int = 8000,
     model: str | None = None,
-    config: str | None = None,
     quantization: str | None = None,
-    backend: str = "llama_cpp",
+    backend: str | None = None,
+    download_dir: str | None = None,
+    preset: str | None = None,
 ) -> None:
     """Run the WebUI server (synchronous entry point)."""
     import uvicorn
 
     if model:
         os.environ["MINIFORGE_MODEL"] = model
-    if config:
-        os.environ["MINIFORGE_CONFIG"] = config
     if quantization:
         os.environ["MINIFORGE_QUANTIZATION"] = quantization
-    os.environ["MINIFORGE_BACKEND"] = backend
+    if download_dir:
+        os.environ["MINIFORGE_DOWNLOAD_DIR"] = download_dir
+    if preset:
+        os.environ["MINIFORGE_PRESET"] = preset
+    if backend:
+        os.environ["MINIFORGE_BACKEND"] = backend
 
     app = create_app()
     uvicorn.run(app, host=host, port=port, log_level="info")

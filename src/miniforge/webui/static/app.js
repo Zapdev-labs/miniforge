@@ -3,6 +3,7 @@
   const $$ = (sel) => document.querySelectorAll(sel);
 
   let conversations = JSON.parse(localStorage.getItem('mf_conversations') || '[]');
+  let settings = JSON.parse(localStorage.getItem('mf_settings') || '{}');
   let currentId = null;
   let isGenerating = false;
 
@@ -12,6 +13,31 @@
   const conversationList = $('#conversationList');
   const welcome = $('#welcome');
   const statusText = $('#statusText');
+  const statusMeta = $('#statusMeta');
+  const runtimePill = $('#runtimePill');
+  const runtimeModel = $('#runtimeModel');
+  const runtimeDetails = $('#runtimeDetails');
+
+  function saveSettings() {
+    localStorage.setItem('mf_settings', JSON.stringify(settings));
+  }
+
+  function loadSettings() {
+    $('#systemPrompt').value = settings.systemPrompt || 'You are a helpful assistant.';
+    $('#maxTokens').value = settings.maxTokens || 512;
+    $('#temperature').value = settings.temperature || 1.0;
+    $('#topP').value = settings.topP || 0.95;
+  }
+
+  function persistSettings() {
+    settings = {
+      systemPrompt: $('#systemPrompt').value,
+      maxTokens: $('#maxTokens').value,
+      temperature: $('#temperature').value,
+      topP: $('#topP').value,
+    };
+    saveSettings();
+  }
 
   function saveConversations() {
     localStorage.setItem('mf_conversations', JSON.stringify(conversations));
@@ -147,6 +173,17 @@
         }),
       });
 
+      if (!response.ok || !response.body) {
+        let errorMessage = 'Request failed';
+        try {
+          const errorBody = await response.json();
+          errorMessage = errorBody.error || errorMessage;
+        } catch (e) {
+          errorMessage = response.statusText || errorMessage;
+        }
+        throw new Error(errorMessage);
+      }
+
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let assistantText = '';
@@ -225,23 +262,46 @@
   modal.addEventListener('click', (e) => {
     if (e.target === modal) modal.classList.remove('open');
   });
+  ['systemPrompt', 'maxTokens', 'temperature', 'topP'].forEach((id) => {
+    $('#' + id).addEventListener('change', persistSettings);
+  });
 
   // Health check
+  function renderRuntime(runtime) {
+    const healthy = runtime.status === 'healthy';
+    const config = runtime.config || {};
+    const modelId = runtime.model?.id || config.model_id || 'Miniforge';
+    const backend = runtime.model?.backend || config.backend || 'unknown';
+    const quantization = runtime.model?.quantization || config.quantization || 'unknown';
+    const context = config.n_ctx ? `${config.n_ctx.toLocaleString()} ctx` : 'context unknown';
+
+    runtimePill.textContent = healthy ? 'Ready' : 'Degraded';
+    runtimePill.classList.toggle('degraded', !healthy);
+    runtimeModel.textContent = modelId;
+    runtimeDetails.textContent = `${backend} | ${quantization} | ${context}`;
+    statusText.textContent = healthy ? 'Ready' : 'Runtime needs attention';
+    statusText.style.color = healthy ? '#10a37f' : '#cc9900';
+    statusMeta.textContent = runtime.load_error || `${backend} | ${quantization}`;
+  }
+
   async function checkHealth() {
     try {
-      const res = await fetch('/health');
+      const res = await fetch('/api/runtime');
       const data = await res.json();
-      statusText.textContent = data.status === 'healthy' ? 'Ready' : 'Loading model...';
-      statusText.style.color = data.status === 'healthy' ? '#10a37f' : '#cc9900';
+      renderRuntime(data);
     } catch {
       statusText.textContent = 'Offline';
       statusText.style.color = '#cc3333';
+      statusMeta.textContent = 'Could not reach server';
+      runtimePill.textContent = 'Offline';
+      runtimePill.classList.add('degraded');
     }
   }
   checkHealth();
   setInterval(checkHealth, 5000);
 
   // Init
+  loadSettings();
   if (conversations.length === 0) createConversation();
   else { currentId = conversations[conversations.length - 1].id; renderSidebar(); renderMessages(); }
 })();
