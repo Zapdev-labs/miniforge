@@ -2,8 +2,9 @@
 
 from typing import Optional, List
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
+import json
 import logging
 import os
 
@@ -23,6 +24,22 @@ class ModelInfo:
     tools: bool = True
     max_context: int = 196_608
     is_moe: bool = False
+
+
+@dataclass
+class HostedModel:
+    """Locally hosted model entry managed by Miniforge."""
+
+    id: str
+    path: str
+    backend: str = "llama_cpp"
+    quantization: str | None = None
+    format: str = "gguf"
+    description: str = "Locally hosted model"
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation."""
+        return asdict(self)
 
 
 # Known models - organized by model family
@@ -709,6 +726,265 @@ class ModelRegistry:
         self.gguf_dir.mkdir(exist_ok=True)
         self.hf_dir = self.cache_dir / "huggingface"
         self.hf_dir.mkdir(exist_ok=True)
+        self.hosted_manifest = self.cache_dir / "hosted-models.json"
+
+    @staticmethod
+    def _infer_quantization_from_name(path: Path) -> str | None:
+        """Infer a GGUF quantization tag from a filename when possible."""
+        known_quants = [
+            "UD-TQ1_0",
+            "UD-IQ1_S",
+            "UD-IQ1_M",
+            "UD-IQ2_XXS",
+            "UD-IQ2_M",
+            "UD-Q2_K_XL",
+            "UD-IQ3_XXS",
+            "UD-IQ3_S",
+            "UD-IQ3_K_S",
+            "UD-Q3_K_M",
+            "UD-Q3_K_XL",
+            "UD-IQ4_XS",
+            "UD-Q4_K_S",
+            "UD-Q4_NL",
+            "UD-Q4_K_M",
+            "UD-Q4_K_XL",
+            "UD-Q5_K_S",
+            "UD-Q5_K_M",
+            "UD-Q5_K_XL",
+            "UD-Q6_K",
+            "UD-Q6_K_XL",
+            "UD-Q8_K_XL",
+            "MXFP4_MOE",
+            "Q2_K",
+            "Q3_K",
+            "Q3_K_S",
+            "Q3_K_M",
+            "Q4_K_M",
+            "Q5_K_M",
+            "Q6_K",
+            "Q8_0",
+            "BF16",
+            "F16",
+        ]
+        name = path.name.upper()
+        for quant in known_quants:
+            if quant.upper() in name:
+                return quant
+        return None
+
+    @staticmethod
+    def _is_first_split_gguf(path: Path) -> bool:
+        """Prefer the first shard for split GGUF models."""
+        name = path.name.lower()
+        split_markers = ("00001-of", "-00001-", "-00001.", "part-00001")
+        return any(marker in name for marker in split_markers)
+
+    def _load_hosted_manifest(self) -> list[HostedModel]:
+        """Load locally hosted model registrations."""
+        if not self.hosted_manifest.exists():
+            return []
+
+        try:
+            raw = json.loads(self.hosted_manifest.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Could not read hosted model manifest %s: %s", self.hosted_manifest, exc)
+            return []
+
+        entries = raw.get("models", raw) if isinstance(raw, dict) else raw
+        if not isinstance(entries, list):
+            return []
+
+        hosted: list[HostedModel] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            model_id = entry.get("id")
+            path = entry.get("path")
+            if not isinstance(model_id, str) or not isinstance(path, str):
+                continue
+            hosted.append(
+                HostedModel(
+                    id=model_id,
+                    path=path,
+                    backend=str(entry.get("backend", "llama_cpp")),
+                    quantization=(
+                        entry.get("quantization")
+                        if isinstance(entry.get("quantization"), str)
+                        else None
+                    ),
+                    format=str(entry.get("format", "gguf")),
+                    description=str(entry.get("description", "Locally hosted model")),
+                )
+            )
+        return hosted
+
+    def _write_hosted_manifest(self, models: list[HostedModel]) -> None:
+        """Persist locally hosted model registrations."""
+        payload = {"version": 1, "models": [model.to_dict() for model in models]}
+        self.hosted_manifest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def list_hosted_models(self) -> list[HostedModel]:
+        """Return registered local model hosting entries."""
+        return self._load_hosted_manifest()
+
+    def register_local_model(
+        self,
+        model_id: str,
+        path: Path,
+        backend: str | None = None,
+        quantization: str | None = None,
+        description: str | None = None,
+    ) -> HostedModel:
+        """Register a local model path so runtime never needs an external registry."""
+        resolved = path.expanduser().resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"Local model path does not exist: {resolved}")
+
+        gguf_path = self.find_gguf_in_repo(resolved) if resolved.is_dir() else None
+        is_gguf = resolved.suffix.lower() == ".gguf" or gguf_path is not None
+        selected_backend = backend or ("llama_cpp" if is_gguf else "transformers")
+        selected_format = "gguf" if is_gguf else "transformers"
+        selected_quant = quantization or self._infer_quantization_from_name(gguf_path or resolved)
+
+        hosted = HostedModel(
+            id=model_id,
+            path=str(resolved),
+            backend=selected_backend,
+            quantization=selected_quant,
+            format=selected_format,
+            description=description or "Locally hosted model",
+        )
+
+        models = [model for model in self._load_hosted_manifest() if model.id != model_id]
+        models.append(hosted)
+        models.sort(key=lambda model: model.id.lower())
+        self._write_hosted_manifest(models)
+        logger.info("Registered local model %s -> %s", model_id, resolved)
+        return hosted
+
+    def _model_search_dirs(self, extra_dirs: list[Path] | None = None) -> list[Path]:
+        """Build ordered local directories to inspect for hosted model files."""
+        candidates: list[Path] = []
+        if extra_dirs:
+            candidates.extend(extra_dirs)
+
+        env_dirs = os.environ.get("MINIFORGE_MODEL_DIRS")
+        if env_dirs:
+            separator = ";" if ";" in env_dirs else "," if "," in env_dirs else os.pathsep
+            if separator == os.pathsep and len(env_dirs) > 2 and env_dirs[1] == ":":
+                separator = ";"
+            for raw in env_dirs.split(separator):
+                if raw.strip():
+                    candidates.append(Path(raw.strip()).expanduser())
+
+        candidates.append(self.gguf_dir)
+
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for directory in candidates:
+            try:
+                resolved = directory.expanduser().resolve()
+            except OSError:
+                resolved = directory.expanduser()
+            key = str(resolved)
+            if key not in seen and resolved.exists() and resolved.is_dir():
+                seen.add(key)
+                unique.append(resolved)
+        return unique
+
+    def _find_gguf_in_dir(
+        self,
+        root: Path,
+        model_id: str,
+        quantization: str | None,
+    ) -> Path | None:
+        """Find the best matching GGUF file in a local directory tree."""
+        gguf_files = sorted(root.rglob("*.gguf")) if root.is_dir() else []
+        if not gguf_files:
+            return None
+
+        model_terms = {
+            model_id.lower(),
+            model_id.split("/")[-1].lower(),
+            self.model_id_to_cache_stem(model_id).lower(),
+        }
+        requested_quant = quantization.lower() if quantization else None
+
+        def score(path: Path) -> tuple[int, str]:
+            haystack = str(path).lower()
+            value = 0
+            if requested_quant and requested_quant in haystack:
+                value += 100
+            if any(term and term in haystack for term in model_terms):
+                value += 50
+            if self._is_first_split_gguf(path):
+                value += 10
+            return (-value, str(path))
+
+        best = sorted(gguf_files, key=score)[0]
+        best_score = -score(best)[0]
+        if best_score == 0 and len(gguf_files) > 1:
+            return None
+        if requested_quant and requested_quant not in str(best).lower():
+            quant_matches = [path for path in gguf_files if requested_quant in str(path).lower()]
+            if quant_matches:
+                return sorted(quant_matches, key=score)[0]
+        return best
+
+    def resolve_local_model(
+        self,
+        model_id: str,
+        quantization: str | None = None,
+        backend: str | None = None,
+        search_dirs: list[Path] | None = None,
+    ) -> Path | None:
+        """Resolve a model from local paths, registrations, or configured model roots."""
+        direct_path = Path(model_id).expanduser()
+        try:
+            if direct_path.exists():
+                if direct_path.is_file():
+                    return direct_path
+                if backend == "transformers" and (direct_path / "config.json").exists():
+                    return direct_path
+                return self._find_gguf_in_dir(direct_path, model_id, quantization) or direct_path
+        except OSError:
+            pass
+
+        for hosted in self._load_hosted_manifest():
+            if hosted.id != model_id:
+                continue
+            hosted_path = Path(hosted.path).expanduser()
+            if not hosted_path.exists():
+                logger.warning(
+                    "Registered model %s points to missing path %s", hosted.id, hosted.path
+                )
+                return None
+            if backend is not None and hosted.backend != backend:
+                logger.debug(
+                    "Using hosted model %s with registered backend %s despite requested backend %s",
+                    hosted.id,
+                    hosted.backend,
+                    backend,
+                )
+            if hosted_path.is_file():
+                return hosted_path
+            if hosted.backend == "transformers" and (hosted_path / "config.json").exists():
+                return hosted_path
+            return self._find_gguf_in_dir(hosted_path, model_id, quantization) or hosted_path
+
+        for root in self._model_search_dirs(search_dirs):
+            exact = root / model_id
+            if exact.exists():
+                if exact.is_file():
+                    return exact
+                found = self._find_gguf_in_dir(exact, model_id, quantization)
+                if found is not None:
+                    return found
+            found = self._find_gguf_in_dir(root, model_id, quantization)
+            if found is not None:
+                return found
+
+        return None
 
     @staticmethod
     def hf_hub_models_root() -> Path:
@@ -878,16 +1154,17 @@ class ModelRegistry:
                 "kimi": ["kimi"],
             }
             keywords = family_map.get(family_lower, [family_lower])
-            models = [
-                m for m in models
-                if any(kw in m.id.lower() for kw in keywords)
-            ]
+            models = [m for m in models if any(kw in m.id.lower() for kw in keywords)]
 
         return models
 
     def list_cached_models(self) -> List[str]:
         """List all cached models."""
         models = []
+
+        for hosted in self.list_hosted_models():
+            suffix = f" ({hosted.quantization})" if hosted.quantization else ""
+            models.append(f"[Hosted] {hosted.id}{suffix} -> {hosted.path}")
 
         # List GGUF models
         for gguf_file in self.gguf_dir.glob("*.gguf"):

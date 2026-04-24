@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Optional
 
 from miniforge.utils.config import M7Config
-from miniforge.utils.hardware import HardwareProfile, auto_config, detect_hardware
+from miniforge.utils.hardware import (
+    HardwareProfile,
+    OptimizationReport,
+    auto_config,
+    detect_hardware,
+    recommend_optimizations,
+)
 from miniforge.utils.monitoring import GenerationMetrics, MemoryMonitor, PerformanceMonitor
 
 __all__ = [
@@ -16,7 +22,9 @@ __all__ = [
     "GenerationMetrics",
     "detect_hardware",
     "auto_config",
+    "recommend_optimizations",
     "HardwareProfile",
+    "OptimizationReport",
 ]
 
 

@@ -1,6 +1,6 @@
 """Main MiniMax model interface."""
 
-from typing import Optional, Union, List, Dict, Any, AsyncIterator
+from typing import Optional, Union, List, Dict, AsyncIterator
 from pathlib import Path
 import asyncio
 import logging
@@ -72,7 +72,7 @@ class Miniforge:
         model_id: str = "MiniMaxAI/MiniMax-M2.7",
         quantization: Optional[str] = None,
         config: Optional[M7Config] = None,
-        backend: str = "llama_cpp",
+        backend: Optional[str] = None,
         cache_dir: Optional[str] = None,
         download_dir: Optional[str] = None,
     ) -> "Miniforge":
@@ -93,7 +93,18 @@ class Miniforge:
         """
         # Create or update config with cache_dir / download_dir
         if config is None:
-            config = M7Config.auto()
+            registry = get_registry(Path(cache_dir) if cache_dir else None)
+            model_info = registry.get_model_info(model_id)
+            if model_info is not None:
+                config = M7Config.auto(
+                    model_params_b=model_info.params_billions,
+                    is_moe=model_info.is_moe,
+                )
+                config.quantization = model_info.default_quantization
+                config.max_model_ctx = model_info.max_context
+                config.is_moe = model_info.is_moe
+            else:
+                config = M7Config.auto()
         if cache_dir is not None:
             config.cache_dir = cache_dir
         # download_dir overrides where GGUF files land (e.g. "D:/AI" for large models)
@@ -102,7 +113,8 @@ class Miniforge:
         elif config.download_dir:
             download_dir = config.download_dir
 
-        instance = cls(model_id, config, backend)
+        selected_backend = backend or config.backend
+        instance = cls(model_id, config, selected_backend)
         await instance._load_model(quantization, download_dir=download_dir)
         return instance
 
@@ -259,15 +271,67 @@ class Miniforge:
             else:
                 quantization = self._memory_manager.select_quantization(params)
 
-        # Check if model_id is a local path first
+        configured_search_dirs: list[Path] = []
+        if self.config.download_dir:
+            configured_search_dirs.append(Path(self.config.download_dir).expanduser())
+        if download_dir:
+            configured_search_dirs.append(Path(download_dir).expanduser())
+        if self.config.model_dirs:
+            configured_search_dirs.extend(
+                Path(path).expanduser() for path in self.config.model_dirs
+            )
+
+        for hosted in self._registry.list_hosted_models():
+            if hosted.id == model_id:
+                self.backend_name = hosted.backend
+                break
+
+        configured_weights = self.config.resolved_model_weights_dir()
         local_path = Path(model_id).expanduser()
-        if local_path.exists():
+        if configured_weights is not None:
+            resolved_weights = self._registry.resolve_local_model(
+                str(configured_weights),
+                quantization,
+                backend=self.backend_name,
+                search_dirs=configured_search_dirs,
+            )
+            if resolved_weights is None:
+                raise FileNotFoundError(
+                    f"Configured model_weights_path was not found: {configured_weights}"
+                )
+            logger.info("Using configured local model weights: %s", resolved_weights)
+            model_path = resolved_weights
+        # Check if model_id is a local path first
+        elif local_path.exists():
             logger.info(f"Using local model path: {local_path}")
-            model_path = local_path
+            resolved_local = self._registry.resolve_local_model(
+                model_id,
+                quantization,
+                backend=self.backend_name,
+                search_dirs=configured_search_dirs,
+            )
+            model_path = resolved_local or local_path
+        elif hosted_path := self._registry.resolve_local_model(
+            model_id,
+            quantization,
+            backend=self.backend_name,
+            search_dirs=configured_search_dirs,
+        ):
+            logger.info("Using hosted/local model: %s", hosted_path)
+            model_path = hosted_path
         # Check cache for GGUF
         elif cached_path := self._registry.get_cached_gguf_path(model_id, quantization):
             logger.info(f"Using cached GGUF: {cached_path}")
             model_path = cached_path
+        elif self.config.offline:
+            searched = [str(path) for path in configured_search_dirs]
+            searched.append(str(self._registry.gguf_dir))
+            raise FileNotFoundError(
+                "Offline mode is enabled and no local model was found for "
+                f"{model_id!r} ({quantization}). Searched: {', '.join(searched)}. "
+                "Register a local model with `miniforge register <id> <path>` or set "
+                "MINIFORGE_MODEL_DIRS."
+            )
         elif self.backend_name == "llama_cpp":
             # Try to download GGUF from HuggingFace
             try:
@@ -480,6 +544,18 @@ class Miniforge:
             trial = Path(model_id)
             model_path = trial if trial.exists() else model_id
 
+        if (
+            self.backend_name == "llama_cpp"
+            and isinstance(model_path, Path)
+            and model_path.is_dir()
+        ):
+            gguf = self._registry.find_gguf_in_repo(model_path)
+            if gguf is None:
+                raise ValueError(
+                    f"llama_cpp backend requires a GGUF file, but no .gguf was found in {model_path}"
+                )
+            model_path = gguf
+
         # Initialize engine
         backend_config = self.config.get_backend_config()
 
@@ -622,6 +698,35 @@ class Miniforge:
                 return final_response
 
         return response
+
+    async def chat_messages(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        stream: bool = False,
+    ) -> Union[str, AsyncIterator[str]]:
+        """Run chat completion from an OpenAI-style message list."""
+        if not self._engine:
+            raise RuntimeError("Model not initialized. Call initialize() first.")
+
+        gen_params = self.config.get_generation_defaults()
+        if max_tokens is not None:
+            gen_params["max_tokens"] = max_tokens
+        if temperature is not None:
+            gen_params["temperature"] = temperature
+        if top_p is not None:
+            gen_params["top_p"] = top_p
+        if top_k is not None:
+            gen_params["top_k"] = top_k
+
+        return await self._engine.chat(
+            messages=messages,
+            stream=stream,
+            **gen_params,
+        )
 
     async def chat_vision(
         self,

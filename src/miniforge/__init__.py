@@ -10,7 +10,13 @@ __author__ = "Miniforge User"
 from miniforge.core.engine import InferenceEngine
 from miniforge.models.minimax import Miniforge
 from miniforge.utils.config import M7Config
-from miniforge.utils.hardware import HardwareProfile, auto_config, detect_hardware
+from miniforge.utils.hardware import (
+    HardwareProfile,
+    OptimizationReport,
+    auto_config,
+    detect_hardware,
+    recommend_optimizations,
+)
 
 __all__ = [
     "Miniforge",
@@ -18,5 +24,7 @@ __all__ = [
     "M7Config",
     "detect_hardware",
     "auto_config",
+    "recommend_optimizations",
     "HardwareProfile",
+    "OptimizationReport",
 ]

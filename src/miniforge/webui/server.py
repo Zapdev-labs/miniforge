@@ -99,8 +99,9 @@ class ServerState:
             "id": model_id,
             "object": "model",
             "owned_by": "miniforge",
-            "backend": config.backend,
+            "backend": getattr(self.model, "backend_name", config.backend),
             "quantization": config.quantization,
+            "offline": config.offline,
         }
         logger.info("Model loaded successfully.")
 
@@ -116,7 +117,7 @@ class ServerState:
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
-        response = await self.model.chat(
+        response = await self.model.chat_messages(
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -244,9 +245,33 @@ def create_app() -> FastAPI:
     @app.get("/v1/models")
     async def list_models() -> dict[str, Any]:
         """OpenAI-compatible models list."""
+        data: list[dict[str, Any]] = []
+        if _state.model_info:
+            data.append(_state.model_info)
+        try:
+            from miniforge.models.registry import get_registry
+
+            cache_dir = (
+                Path(_state.config.cache_dir) if _state.config and _state.config.cache_dir else None
+            )
+            for hosted in get_registry(cache_dir).list_hosted_models():
+                if any(model.get("id") == hosted.id for model in data):
+                    continue
+                data.append(
+                    {
+                        "id": hosted.id,
+                        "object": "model",
+                        "owned_by": "miniforge-local",
+                        "backend": hosted.backend,
+                        "quantization": hosted.quantization,
+                        "path": hosted.path,
+                    }
+                )
+        except Exception as exc:
+            logger.debug("Could not list hosted models: %s", exc)
         return {
             "object": "list",
-            "data": [_state.model_info] if _state.model_info else [],
+            "data": data,
         }
 
     @app.post("/v1/chat/completions", response_model=None)
@@ -439,6 +464,8 @@ def run_server(
     backend: str | None = None,
     download_dir: str | None = None,
     preset: str | None = None,
+    model_dirs: list[str] | None = None,
+    offline: bool | None = None,
 ) -> None:
     """Run the WebUI server (synchronous entry point)."""
     import uvicorn
@@ -453,6 +480,10 @@ def run_server(
         os.environ["MINIFORGE_PRESET"] = preset
     if backend:
         os.environ["MINIFORGE_BACKEND"] = backend
+    if model_dirs:
+        os.environ["MINIFORGE_MODEL_DIRS"] = ";".join(model_dirs)
+    if offline:
+        os.environ["MINIFORGE_OFFLINE"] = "1"
 
     app = create_app()
     uvicorn.run(app, host=host, port=port, log_level="info")

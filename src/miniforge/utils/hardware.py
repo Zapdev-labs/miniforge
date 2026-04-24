@@ -70,7 +70,7 @@ class HardwareProfile:
 
     cpu: CpuInfo = field(default_factory=CpuInfo)
     total_ram_gb: float = 16.0
-    available_ram_gb: float = 8.0
+    available_ram_gb: float = 0.0
     gpus: list[GpuInfo] = field(default_factory=list)
     os_name: str = "unknown"
     is_wsl: bool = False
@@ -87,6 +87,54 @@ class HardwareProfile:
     def has_dgpu(self) -> bool:
         """Check if a discrete GPU is present."""
         return any(gpu.vram_gb > 8.0 for gpu in self.gpus)
+
+    @property
+    def best_gpu(self) -> GpuInfo | None:
+        """Return the GPU with the most VRAM, if one was detected."""
+        if not self.gpus:
+            return None
+        return max(self.gpus, key=lambda gpu: gpu.vram_gb)
+
+    @property
+    def memory_pressure(self) -> str:
+        """Classify current free RAM pressure for runtime tuning."""
+        if self.total_ram_gb <= 0 or self.available_ram_gb <= 0:
+            return "unknown"
+        ratio = self.available_ram_gb / self.total_ram_gb
+        if ratio < 0.20:
+            return "high"
+        if ratio < 0.35:
+            return "medium"
+        return "low"
+
+    @property
+    def hardware_tier(self) -> str:
+        """Broad local inference tier used for user-facing diagnostics."""
+        best_gpu = self.best_gpu
+        if self.total_ram_gb >= 64 or (best_gpu is not None and best_gpu.vram_gb >= 16):
+            return "workstation"
+        if self.total_ram_gb >= 28 or self.cpu.physical_cores >= 8:
+            return "balanced"
+        return "constrained"
+
+
+@dataclass
+class OptimizationReport:
+    """Explainable hardware tuning result."""
+
+    settings: dict[str, Any]
+    tier: str
+    reasons: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable report."""
+        return {
+            "tier": self.tier,
+            "settings": self.settings,
+            "reasons": self.reasons,
+            "warnings": self.warnings,
+        }
 
 
 def _read_cpu_flags_linux() -> list[str]:
@@ -432,30 +480,50 @@ def _infer_quantization(ram_gb: float, model_params_b: float, is_moe: bool = Fal
     return "UD-IQ2_XXS"
 
 
-def auto_config(
+def recommend_optimizations(
     model_params_b: float = 2.7,
     is_moe: bool = False,
     profile: HardwareProfile | None = None,
-) -> dict[str, Any]:
-    """Generate configuration dict tuned to detected hardware.
+) -> OptimizationReport:
+    """Generate explainable runtime optimizations for detected hardware.
 
-    Returns a dict that can be splatted into M7Config(**auto_config(...)).
+    Returns settings that can be splatted into ``M7Config`` plus user-facing
+    reasons and warnings for CLI/server diagnostics.
     """
     if profile is None:
         profile = detect_hardware()
 
     config: dict[str, Any] = {}
+    reasons: list[str] = []
+    warnings: list[str] = []
 
     # Threads: physical cores for compute-bound inference
     config["n_threads"] = max(1, profile.cpu.physical_cores)
     # On systems with SMT, we can use logical cores for batch work
     if profile.cpu.logical_cores > profile.cpu.physical_cores:
         config["n_threads"] = max(1, profile.cpu.physical_cores + profile.cpu.physical_cores // 2)
+    logical_cores = max(1, profile.cpu.logical_cores)
+    config["cpu_mask"] = f"0-{logical_cores - 1}" if logical_cores > 1 else "0"
+    reasons.append(
+        f"Using {config['n_threads']} inference threads from "
+        f"{profile.cpu.physical_cores} physical cores / {logical_cores} logical threads."
+    )
 
     # RAM-based safety
     total_ram = profile.total_ram_gb
     config["max_memory_gb"] = max(4.0, total_ram - 4.0)
     config["reserve_memory_gb"] = min(4.0, total_ram * 0.15)
+    if profile.memory_pressure == "high":
+        config["max_memory_gb"] = max(
+            4.0, min(config["max_memory_gb"], profile.available_ram_gb * 0.85)
+        )
+        warnings.append(
+            "Available RAM is under 20%; reduced runtime memory target to avoid swap pressure."
+        )
+    elif profile.memory_pressure == "medium":
+        warnings.append(
+            "Available RAM is moderately low; close memory-heavy apps for longer context."
+        )
 
     # Batch sizes scale with available RAM
     if total_ram >= 64:
@@ -470,6 +538,9 @@ def auto_config(
     else:
         config["n_batch"] = 512
         config["n_ubatch"] = 256
+    if profile.memory_pressure == "high":
+        config["n_batch"] = min(config["n_batch"], 512)
+        config["n_ubatch"] = min(config["n_ubatch"], 256)
 
     # Context window: aim high but safe
     if total_ram >= 64:
@@ -478,13 +549,22 @@ def auto_config(
         config["n_ctx"] = 98_304
     else:
         config["n_ctx"] = 32_768
+    if profile.memory_pressure == "high":
+        config["n_ctx"] = min(config["n_ctx"], 16_384)
+    elif profile.memory_pressure == "medium":
+        config["n_ctx"] = min(config["n_ctx"], 65_536)
 
     # Quantization
     config["quantization"] = _infer_quantization(total_ram, model_params_b, is_moe)
+    reasons.append(
+        f"Selected {config['quantization']} quantization for ~{model_params_b:.1f}B params "
+        f"on {total_ram:.1f}GB RAM."
+    )
 
     # KV cache: q4_0 is the safest aggressive default
     config["cache_type_k"] = "q4_0"
     config["cache_type_v"] = "q4_0"
+    reasons.append("Using q4_0 KV cache for broad llama.cpp compatibility and lower RAM use.")
 
     # CPU ISA
     config["use_avx"] = profile.cpu.has_avx
@@ -492,6 +572,10 @@ def auto_config(
     config["use_avx512"] = profile.cpu.has_avx512
     config["use_fma"] = profile.cpu.has_fma
     config["use_f16c"] = profile.cpu.has_f16c
+    if profile.cpu.has_avx2:
+        reasons.append("AVX2 detected; CPU backend can use wider vector kernels.")
+    elif not profile.cpu.has_avx:
+        warnings.append("AVX was not detected; CPU inference may be significantly slower.")
 
     # OS-specific tweaks
     if profile.is_wsl:
@@ -499,6 +583,9 @@ def auto_config(
         config["use_mmap"] = True
         # WSL2 memory reclaim can be aggressive; be conservative
         config["max_memory_gb"] = max(4.0, total_ram * 0.65)
+        warnings.append(
+            "WSL detected; mmap enabled and mlock disabled for safer large-model paging."
+        )
     elif profile.is_linux:
         config["use_mlock"] = False  # Most users won't have unlimited memlock
         config["use_mmap"] = True
@@ -512,23 +599,57 @@ def auto_config(
         for gpu in profile.gpus:
             if gpu.vendor == "NVIDIA" and gpu.vram_gb >= 4.0:
                 config["n_gpu_layers"] = min(20, int(gpu.vram_gb * 3))
+                reasons.append(
+                    f"Detected NVIDIA GPU with {gpu.vram_gb:.1f}GB VRAM; enabling partial layer offload."
+                )
                 break
             elif gpu.vendor == "AMD" and gpu.vram_gb >= 2.0:
                 config["n_gpu_layers"] = min(15, int(gpu.vram_gb * 3))
+                reasons.append(
+                    f"Detected AMD GPU with {gpu.vram_gb:.1f}GB VRAM; enabling conservative offload."
+                )
                 break
+    else:
+        reasons.append("No usable GPU detected; optimized for CPU inference with mmap.")
 
     # Priority
     config["priority"] = "normal"
-    if not profile.is_windows:
+    if not profile.is_windows and profile.memory_pressure != "high":
         config["priority"] = "high"
 
     # MoE
+    config["is_moe"] = is_moe
     if is_moe:
-        config["is_moe"] = True
         config["use_mmap"] = True
         config["use_mlock"] = False
         config["n_batch"] = min(config.get("n_batch", 2048), 512)
         config["n_ubatch"] = min(config.get("n_ubatch", 512), 256)
+        reasons.append("MoE model detected; mmap is required so inactive experts stay on disk.")
+        if total_ram < 32:
+            warnings.append(
+                "MoE model on under 32GB RAM depends heavily on fast local SSD/NVMe storage."
+            )
 
     logger.info("Auto-config: %s", config)
-    return config
+    return OptimizationReport(
+        settings=config,
+        tier=profile.hardware_tier,
+        reasons=reasons,
+        warnings=warnings,
+    )
+
+
+def auto_config(
+    model_params_b: float = 2.7,
+    is_moe: bool = False,
+    profile: HardwareProfile | None = None,
+) -> dict[str, Any]:
+    """Generate configuration dict tuned to detected hardware.
+
+    Returns a dict that can be splatted into M7Config(**auto_config(...)).
+    """
+    return recommend_optimizations(
+        model_params_b=model_params_b,
+        is_moe=is_moe,
+        profile=profile,
+    ).settings

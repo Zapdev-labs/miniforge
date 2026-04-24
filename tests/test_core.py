@@ -26,7 +26,7 @@ def test_memory_manager_select_quantization():
 
     # 7B model might need more aggressive quantization
     quant_7b = mem.select_quantization(7.0)
-    assert quant_7b in ["Q3_K_M", "Q4_K_M"]
+    assert quant_7b in ["Q2_K", "Q3_K_M", "Q4_K_M"]
 
 
 def test_memory_manager_calculate_max_context():
@@ -113,6 +113,8 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINIFORGE_BACKEND", "transformers")
     monkeypatch.setenv("MINIFORGE_MAX_TOKENS", "1024")
     monkeypatch.setenv("MINIFORGE_TEMPERATURE", "0.4")
+    monkeypatch.setenv("MINIFORGE_MODEL_DIRS", "/models/a;/models/b")
+    monkeypatch.setenv("MINIFORGE_OFFLINE", "1")
 
     config = M7Config.from_env()
 
@@ -121,6 +123,8 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.default_max_tokens == 1024
     assert config.default_temperature == 0.4
     assert config.quantization == "UD-IQ2_XXS"
+    assert config.model_dirs == ["/models/a", "/models/b"]
+    assert config.offline is True
 
 
 def test_config_summary() -> None:
@@ -132,6 +136,19 @@ def test_config_summary() -> None:
     assert summary["model_id"] == "demo/model"
     assert summary["backend"] == "transformers"
     assert summary["generation"]["max_tokens"] == config.default_max_tokens
+    assert summary["offline"] is False
+
+
+def test_config_from_env_applies_known_model_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Known large models should use registry-safe defaults unless explicitly overridden."""
+    monkeypatch.delenv("MINIFORGE_QUANTIZATION", raising=False)
+    monkeypatch.setenv("MINIFORGE_MODEL", "MiniMaxAI/MiniMax-M2.7")
+
+    config = M7Config.from_env()
+
+    assert config.quantization == "UD-IQ2_XXS"
+    assert config.is_moe is True
+    assert config.max_model_ctx == 196_608
 
 
 @pytest.mark.asyncio

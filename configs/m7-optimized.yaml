@@ -55,6 +55,10 @@ enable_streaming: true
 
 # Paths (null = use default)
 cache_dir: null
+download_dir: null
+model_weights_path: null      # Explicit GGUF/HF local path; highest priority
+model_dirs: null              # Optional list of local model roots to scan
+offline: false                # true = never contact external model registries
 
 # Logging
 verbose: false

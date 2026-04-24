@@ -9,6 +9,7 @@ from miniforge.utils.hardware import (
     detect_gpus,
     detect_hardware,
     detect_os,
+    recommend_optimizations,
 )
 
 
@@ -124,3 +125,22 @@ def test_auto_config_memory_presets() -> None:
     cfg_large = auto_config(profile=large)
 
     assert cfg_small["n_batch"] < cfg_large["n_batch"]
+
+
+def test_recommend_optimizations_explains_settings() -> None:
+    """Optimization reports should include config, tier, and explanations."""
+    profile = HardwareProfile(
+        cpu=CpuInfo(physical_cores=8, logical_cores=16, flags=["avx", "avx2"]),
+        total_ram_gb=32.0,
+        available_ram_gb=20.0,
+        gpus=[GpuInfo(name="RTX 4060", vendor="NVIDIA", vram_gb=8.0)],
+    )
+
+    report = recommend_optimizations(model_params_b=7.0, profile=profile)
+
+    assert report.tier == "balanced"
+    assert report.settings["n_threads"] == 12
+    assert report.settings["cpu_mask"] == "0-15"
+    assert report.settings["n_gpu_layers"] > 0
+    assert report.reasons
+    assert report.to_dict()["settings"] == report.settings

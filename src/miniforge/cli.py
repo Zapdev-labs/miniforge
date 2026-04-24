@@ -21,6 +21,8 @@ def _build_config(args: argparse.Namespace) -> M7Config:
         backend=getattr(args, "backend", None),
         quantization=getattr(args, "quantization", None),
         download_dir=getattr(args, "download_dir", None),
+        model_dirs=getattr(args, "model_dirs", None),
+        offline=getattr(args, "offline", None),
         max_tokens=getattr(args, "max_tokens", None),
         temperature=getattr(args, "temperature", None),
         top_p=getattr(args, "top_p", None),
@@ -42,6 +44,18 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser, *, include_generatio
         "--download-dir",
         "-d",
         help="Directory to store/load GGUF files (e.g. D:/AI)",
+    )
+    parser.add_argument(
+        "--model-dir",
+        action="append",
+        dest="model_dirs",
+        help="Local directory to search for hosted models (repeatable)",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        default=None,
+        help="Use only local/cache/hosted model files; never download",
     )
     if include_generation:
         parser.add_argument(
@@ -138,6 +152,8 @@ def cmd_server(args):
         quantization=args.quantization,
         download_dir=args.download_dir,
         preset=args.preset,
+        model_dirs=args.model_dirs,
+        offline=args.offline,
     )
 
 
@@ -158,6 +174,10 @@ def cmd_webui(args):
     env["MINIFORGE_HOST"] = args.host
     if args.download_dir:
         env["MINIFORGE_DOWNLOAD_DIR"] = args.download_dir
+    if args.model_dirs:
+        env["MINIFORGE_MODEL_DIRS"] = ";".join(args.model_dirs)
+    if args.offline:
+        env["MINIFORGE_OFFLINE"] = "1"
 
     start_script = Path(__file__).parent.parent.parent / "start.sh"
     if not start_script.exists():
@@ -198,18 +218,51 @@ def cmd_list(args):
             print(f"  - {model}")
 
 
+def cmd_register(args):
+    """Register a local model for offline hosting."""
+    registry = get_registry()
+    try:
+        hosted = registry.register_local_model(
+            args.model_id,
+            Path(args.path),
+            backend=args.backend,
+            quantization=args.quantization,
+            description=args.description,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Registered {hosted.id}")
+    print(f"  Path: {hosted.path}")
+    print(f"  Backend: {hosted.backend}")
+    print(f"  Format: {hosted.format}")
+    if hosted.quantization:
+        print(f"  Quantization: {hosted.quantization}")
+
+
 def cmd_doctor(args):
     """Show detected hardware and resolved runtime config."""
-    from miniforge.utils.hardware import detect_hardware
+    from miniforge.utils.hardware import detect_hardware, recommend_optimizations
 
     profile = detect_hardware()
     base = M7Config.performance_preset(args.preset) if args.preset else None
     config = M7Config.from_env(base=base)
+    model_info = get_registry(config.cache_dir).get_model_info(config.model_id)
+    model_params_b = model_info.params_billions if model_info else 2.7
+    is_moe = model_info.is_moe if model_info else config.is_moe
+    optimizations = recommend_optimizations(
+        model_params_b=model_params_b,
+        is_moe=is_moe,
+        profile=profile,
+    )
 
     payload = {
         "hardware": {
             "os": profile.os_name,
             "is_wsl": profile.is_wsl,
+            "tier": profile.hardware_tier,
+            "memory_pressure": profile.memory_pressure,
             "cpu": {
                 "brand": profile.cpu.brand,
                 "physical_cores": profile.cpu.physical_cores,
@@ -230,6 +283,7 @@ def cmd_doctor(args):
             ],
         },
         "config": config.summary(),
+        "optimizations": optimizations.to_dict(),
     }
 
     if args.json:
@@ -237,7 +291,10 @@ def cmd_doctor(args):
         return
 
     print("Hardware")
-    print(f"  OS: {payload['hardware']['os']} (WSL={payload['hardware']['is_wsl']})")
+    print(
+        f"  OS: {payload['hardware']['os']} (WSL={payload['hardware']['is_wsl']})"
+        f" [{payload['hardware']['tier']}, memory pressure={payload['hardware']['memory_pressure']}]"
+    )
     print(
         "  CPU: "
         f"{payload['hardware']['cpu']['brand']} "
@@ -267,6 +324,12 @@ def cmd_doctor(args):
         f"  Generation: max_tokens={summary['generation']['max_tokens']}, "
         f"temperature={summary['generation']['temperature']}, top_p={summary['generation']['top_p']}"
     )
+
+    print("\nOptimization notes")
+    for reason in payload["optimizations"]["reasons"]:
+        print(f"  - {reason}")
+    for warning in payload["optimizations"]["warnings"]:
+        print(f"  ! {warning}")
 
 
 def main():
@@ -306,6 +369,16 @@ def main():
     # List command
     list_parser = subparsers.add_parser("list", help="List cached models")
     list_parser.set_defaults(func=cmd_list)
+
+    register_parser = subparsers.add_parser(
+        "register", help="Register a local model for offline hosting"
+    )
+    register_parser.add_argument("model_id", help="Local model ID to expose")
+    register_parser.add_argument("path", help="GGUF file, GGUF directory, or HF model directory")
+    register_parser.add_argument("--backend", choices=["llama_cpp", "transformers"])
+    register_parser.add_argument("--quantization", "-q", help="Quantization tag for GGUF models")
+    register_parser.add_argument("--description", help="Description stored in local manifest")
+    register_parser.set_defaults(func=cmd_register)
 
     doctor_parser = subparsers.add_parser(
         "doctor", help="Show resolved hardware and runtime config"

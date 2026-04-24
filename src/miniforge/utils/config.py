@@ -61,6 +61,25 @@ def _read_float_env(name: str) -> float | None:
         return None
 
 
+def _read_list_env(name: str) -> list[str] | None:
+    """Parse a path/list environment variable when present."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+
+    separators = [";", ","]
+    if os.pathsep in value and not (len(value) > 2 and value[1] == ":"):
+        separators.append(os.pathsep)
+
+    for separator in separators:
+        if separator in value:
+            items = [item.strip() for item in value.split(separator) if item.strip()]
+            return items or None
+
+    stripped = value.strip()
+    return [stripped] if stripped else None
+
+
 @dataclass
 class M7Config:
     """Inference configuration — auto-detected by default, overridable field-by-field."""
@@ -134,6 +153,8 @@ class M7Config:
     cache_dir: str | None = None
     download_dir: str | None = None
     llama_cpp_path: str | None = None
+    model_dirs: list[str] | None = None
+    offline: bool = False
 
     # Per-model overrides (set automatically from registry, or manually)
     max_model_ctx: int | None = None
@@ -272,6 +293,10 @@ class M7Config:
             quantization=os.environ.get("MINIFORGE_QUANTIZATION"),
             download_dir=os.environ.get("MINIFORGE_DOWNLOAD_DIR"),
             cache_dir=os.environ.get("MINIFORGE_CACHE_DIR"),
+            model_weights_path=os.environ.get("MINIFORGE_MODEL_WEIGHTS_PATH"),
+            model_dirs=_read_list_env("MINIFORGE_MODEL_DIRS"),
+            llama_cpp_path=os.environ.get("MINIFORGE_LLAMA_CPP"),
+            offline=_read_bool_env("MINIFORGE_OFFLINE"),
             log_level=os.environ.get("MINIFORGE_LOG_LEVEL"),
             n_ctx=_read_int_env("MINIFORGE_N_CTX"),
             n_threads=_read_int_env("MINIFORGE_N_THREADS"),
@@ -280,6 +305,8 @@ class M7Config:
             top_p=_read_float_env("MINIFORGE_TOP_P"),
             verbose=_read_bool_env("MINIFORGE_VERBOSE"),
         )
+        if os.environ.get("MINIFORGE_QUANTIZATION") is None:
+            config.apply_model_metadata()
         return config
 
     @classmethod
@@ -299,6 +326,25 @@ class M7Config:
         """Convert to dictionary."""
         return asdict(self)
 
+    def apply_model_metadata(self) -> M7Config:
+        """Apply known model registry metadata without changing explicit user paths."""
+        try:
+            from miniforge.models.registry import get_registry
+
+            info = get_registry(Path(self.cache_dir) if self.cache_dir else None).get_model_info(
+                self.model_id
+            )
+        except Exception:
+            info = None
+
+        if info is None:
+            return self
+
+        self.quantization = info.default_quantization
+        self.max_model_ctx = info.max_context
+        self.is_moe = info.is_moe
+        return self
+
     def apply_overrides(
         self,
         *,
@@ -307,6 +353,10 @@ class M7Config:
         quantization: str | None = None,
         download_dir: str | None = None,
         cache_dir: str | None = None,
+        model_weights_path: str | None = None,
+        model_dirs: list[str] | None = None,
+        llama_cpp_path: str | None = None,
+        offline: bool | None = None,
         log_level: str | None = None,
         n_ctx: int | None = None,
         n_threads: int | None = None,
@@ -326,6 +376,14 @@ class M7Config:
             self.download_dir = download_dir
         if cache_dir is not None:
             self.cache_dir = cache_dir
+        if model_weights_path is not None:
+            self.model_weights_path = model_weights_path
+        if model_dirs is not None:
+            self.model_dirs = model_dirs
+        if llama_cpp_path is not None:
+            self.llama_cpp_path = llama_cpp_path
+        if offline is not None:
+            self.offline = offline
         if log_level is not None:
             self.log_level = log_level
         if n_ctx is not None:
@@ -357,6 +415,9 @@ class M7Config:
             "flash_attn": self.flash_attn,
             "download_dir": self.download_dir,
             "cache_dir": self.cache_dir,
+            "model_weights_path": self.model_weights_path,
+            "model_dirs": self.model_dirs,
+            "offline": self.offline,
             "generation": self.get_generation_defaults(),
         }
 
