@@ -1,10 +1,13 @@
 """Llama.cpp backend for high-performance CPU inference."""
 
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
-from pathlib import Path
 import asyncio
+import contextlib
 import logging
+import re
 import time
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -13,9 +16,7 @@ CTX_SAFETY_HEADROOM = 2_048  # Reserve for generation
 DEFAULT_OPTIMAL_CTX = 194_560  # 192K usable context (196608 - 2048)
 
 
-def _resolve_kv_cache_types(
-    cache_type_k: Any, cache_type_v: Any
-) -> Tuple[Optional[int], Optional[int]]:
+def _resolve_kv_cache_types(cache_type_k: Any, cache_type_v: Any) -> tuple[int | None, int | None]:
     """
     Convert user-friendly KV cache type values to llama-cpp enum ints.
 
@@ -25,7 +26,7 @@ def _resolve_kv_cache_types(
     # Hardcoded ggml_type enum values — used when the Python binding
     # doesn't expose GGMLType (older llama-cpp-python builds).
     # Values from ggml/include/ggml.h enum ggml_type.
-    _GGML_TYPE_MAP: Dict[str, int] = {
+    ggml_type_map: dict[str, int] = {
         "F32": 0,
         "F16": 1,
         "Q4_0": 2,
@@ -50,7 +51,7 @@ def _resolve_kv_cache_types(
     except Exception:
         ggml_enum = None
 
-    alias_map: Dict[str, str] = {
+    alias_map: dict[str, str] = {
         "f16": "F16",
         "fp16": "F16",
         "f32": "F32",
@@ -63,12 +64,12 @@ def _resolve_kv_cache_types(
     }
 
     # Fallback chain for aggressive cache types that may not be supported
-    _FALLBACK_CHAINS: Dict[str, List[str]] = {
+    fallback_chains: dict[str, list[str]] = {
         "turbo3": ["q4_0", "q8_0"],
         "turbo4": ["q4_0", "q8_0"],
     }
 
-    def _convert(value: Any) -> Optional[int]:
+    def _convert(value: Any) -> int | None:
         if value is None:
             return None
         if isinstance(value, int):
@@ -79,7 +80,7 @@ def _resolve_kv_cache_types(
         normalized = value.strip().lower()
 
         # Build candidate list: requested type first, then fallbacks
-        candidates = [normalized] + _FALLBACK_CHAINS.get(normalized, [])
+        candidates = [normalized] + fallback_chains.get(normalized, [])
 
         for candidate in candidates:
             enum_name = alias_map.get(candidate, candidate.upper())
@@ -93,17 +94,17 @@ def _resolve_kv_cache_types(
                     return int(enum_value)
 
             # Fall back to hardcoded values
-            if enum_name in _GGML_TYPE_MAP:
+            if enum_name in ggml_type_map:
                 if candidate != normalized:
                     logger.info("KV cache: '%s' -> '%s' (via hardcoded enum)", value, candidate)
-                return _GGML_TYPE_MAP[enum_name]
+                return ggml_type_map[enum_name]
 
         return None
 
     return _convert(cache_type_k), _convert(cache_type_v)
 
 
-def _context_fallbacks(requested_n_ctx: int, max_safe_ctx: int) -> List[int]:
+def _context_fallbacks(requested_n_ctx: int, max_safe_ctx: int) -> list[int]:
     first = min(requested_n_ctx, max_safe_ctx)
     candidates = [
         first,
@@ -117,11 +118,45 @@ def _context_fallbacks(requested_n_ctx: int, max_safe_ctx: int) -> List[int]:
         8_192,
         4_096,
     ]
-    unique: List[int] = []
+    unique: list[int] = []
     for value in candidates:
         if 1024 <= value <= max_safe_ctx and value not in unique:
             unique.append(value)
     return unique
+
+
+def _infer_model_params_from_path(model_path: Path) -> float | None:
+    """Infer parameter count from common local GGUF filenames like Qwen3-8B."""
+    haystack = " ".join([model_path.name, model_path.parent.name])
+    matches = re.findall(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[bB](?![A-Za-z])", haystack)
+    for raw in matches:
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if 0.1 <= value <= 2000.0:
+            return value
+    return None
+
+
+def _auto_dense_context_limit(model_params_b: float) -> int:
+    """Protect dense models from paying huge KV-cache costs by default."""
+    if model_params_b <= 12.0:
+        return 32_768
+    if model_params_b <= 34.0:
+        return 24_576
+    if model_params_b <= 80.0:
+        return 16_384
+    return 8_192
+
+
+def _usage_int(usage: dict[str, Any], key: str, default: int) -> int:
+    value = usage.get(key, default)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return default
 
 
 class LlamaCppBackend:
@@ -135,24 +170,48 @@ class LlamaCppBackend:
     - Flash Attention
     """
 
-    def __init__(self, model_path: Path, config: Dict[str, Any]):
+    def __init__(self, model_path: Path, config: dict[str, Any]):
         self.model_path = model_path
         self.config = config
-        self._llm = None
+        self._llm: Any | None = None
         self._lock = asyncio.Lock()
         self._last_tps: float = 0.0
+        self._last_generation: dict[str, Any] = {}
+        self._runtime_config: dict[str, Any] = {}
 
     async def initialize(self) -> None:
         """Initialize the Llama model with performance optimizations."""
         try:
             from llama_cpp import Llama
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
                 "llama-cpp-python not installed. Install with: uv pip install llama-cpp-python"
-            )
+            ) from exc
 
         # Extract configuration with M7-optimized defaults for full 192K context
         requested_n_ctx = int(self.config.get("n_ctx", DEFAULT_OPTIMAL_CTX))
+        model_params_raw = self.config.get("model_params_b")
+        model_params_b = (
+            float(model_params_raw)
+            if isinstance(model_params_raw, (int, float))
+            else _infer_model_params_from_path(self.model_path)
+        )
+        is_moe = bool(self.config.get("is_moe", False))
+        if (
+            bool(self.config.get("auto_context", True))
+            and model_params_b is not None
+            and not is_moe
+        ):
+            auto_limit = _auto_dense_context_limit(model_params_b)
+            if requested_n_ctx > auto_limit:
+                logger.info(
+                    "Auto context: reducing dense %.1fB model n_ctx %s -> %s. "
+                    "Set auto_context=False or MINIFORGE_N_CTX to override.",
+                    model_params_b,
+                    requested_n_ctx,
+                    auto_limit,
+                )
+                requested_n_ctx = auto_limit
         # Per-model context cap: MiniMax=196K, Kimi K2.5=262K, others use MiniMax default
         model_max_ctx = int(self.config.get("max_model_ctx", MAX_MINIMAX_TRAINED_CTX))
         max_safe_ctx = model_max_ctx - CTX_SAFETY_HEADROOM
@@ -187,7 +246,14 @@ class LlamaCppBackend:
         # Force mmap=True and mlock=False — locking 240+ GB in RAM would crash the system.
         # AirLLM-inspired: also reduce batch sizes to minimize peak memory pressure,
         # letting the OS page-cache hold more active expert weights in RAM.
-        is_moe = self.config.get("is_moe", False)
+        memory_mode = str(self.config.get("memory_mode", "auto"))
+        if memory_mode == "resident" and not is_moe:
+            use_mmap = False
+            use_mlock = False
+        elif memory_mode in {"mmap", "paged_moe"}:
+            use_mmap = True
+            use_mlock = False
+
         if is_moe:
             use_mmap = True
             use_mlock = False
@@ -208,6 +274,7 @@ class LlamaCppBackend:
         logger.info(f"Loading model from {self.model_path}")
         logger.info(f"Context: {n_ctx} tokens (model max: {model_max_ctx})")
         logger.info(f"Threads: {n_threads}, Batch: {n_batch}/{n_ubatch}")
+        logger.info(f"Memory mode: {memory_mode}, mmap={use_mmap}, mlock={use_mlock}")
         logger.info(f"KV cache: k={cache_type_k}, v={cache_type_v}, FlashAttn={flash_attn}")
         if is_moe:
             logger.info(
@@ -273,7 +340,7 @@ class LlamaCppBackend:
 
             _orig_env_init = jinja2.Environment.__init__
 
-            def _env_init_with_loopcontrols(self, *args, **kwargs):
+            def _env_init_with_loopcontrols(self: Any, *args: Any, **kwargs: Any) -> None:
                 ext = kwargs.get("extensions") or []
                 lc = "jinja2.ext.loopcontrols"
                 if lc not in ext:
@@ -281,19 +348,23 @@ class LlamaCppBackend:
                 kwargs["extensions"] = ext
                 _orig_env_init(self, *args, **kwargs)
 
-            jinja2.Environment.__init__ = _env_init_with_loopcontrols
+            jinja2.Environment.__init__ = _env_init_with_loopcontrols  # type: ignore[method-assign]
         except Exception:
             pass
 
         # Initialize in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
-        init_errors: List[str] = []
+        init_errors: list[str] = []
+        initialized_ctx: int | None = None
+        initialized_batch: int | None = None
         try:
             for candidate_ctx in _context_fallbacks(requested_n_ctx, max_safe_ctx):
                 kwargs["n_ctx"] = candidate_ctx
                 kwargs["n_batch"] = min(n_batch, candidate_ctx)
                 try:
                     self._llm = await loop.run_in_executor(None, lambda: Llama(**kwargs))
+                    initialized_ctx = candidate_ctx
+                    initialized_batch = int(kwargs["n_batch"])
                     if candidate_ctx != n_ctx:
                         logger.warning(
                             "Initialized with fallback n_ctx=%s after allocation failure at higher context",
@@ -307,14 +378,29 @@ class LlamaCppBackend:
                     continue
         finally:
             # Restore original Environment.__init__ to avoid side effects
-            try:
-                jinja2.Environment.__init__ = _orig_env_init  # noqa: F821
-            except Exception:
-                pass
+            with contextlib.suppress(Exception):
+                jinja2.Environment.__init__ = _orig_env_init  # type: ignore[method-assign] # noqa: F821
 
         if self._llm is None:
             errors = "; ".join(init_errors) if init_errors else "unknown initialization error"
             raise RuntimeError(f"Failed to initialize llama.cpp context after fallbacks: {errors}")
+
+        self._runtime_config = {
+            "n_ctx": initialized_ctx or n_ctx,
+            "n_threads": n_threads,
+            "n_batch": initialized_batch or min(n_batch, n_ctx),
+            "n_ubatch": n_ubatch,
+            "n_gpu_layers": n_gpu_layers,
+            "main_gpu": main_gpu,
+            "cache_type_k": cache_type_k,
+            "cache_type_v": cache_type_v,
+            "flash_attn": flash_attn,
+            "use_mmap": use_mmap,
+            "use_mlock": use_mlock,
+            "memory_mode": memory_mode,
+            "model_params_b": model_params_b,
+            "is_moe": is_moe,
+        }
 
         logger.info("Llama model loaded successfully")
 
@@ -325,18 +411,19 @@ class LlamaCppBackend:
         temperature: float = 1.0,
         top_p: float = 0.95,
         top_k: int = 40,
-        stop: Optional[List[str]] = None,
+        stop: list[str] | None = None,
     ) -> str:
         """Generate text synchronously."""
         if not self._llm:
             raise RuntimeError("Backend not initialized")
+        llm = self._llm
 
         async with self._lock:
             loop = asyncio.get_event_loop()
             t0 = time.perf_counter()
             result = await loop.run_in_executor(
                 None,
-                lambda: self._llm.create_completion(
+                lambda: llm.create_completion(
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
@@ -347,13 +434,33 @@ class LlamaCppBackend:
             )
             elapsed = time.perf_counter() - t0
 
-        text = result["choices"][0]["text"]
-        # Estimate tokens from completion usage or text length
-        usage = result.get("usage", {})
-        n_tokens = usage.get("completion_tokens", max(1, len(text.split())))
-        tps = n_tokens / elapsed if elapsed > 0 else 0
-        logger.info("Generation: %d tokens in %.1fs (%.2f tok/s)", n_tokens, elapsed, tps)
+        text = str(result["choices"][0]["text"])
+        usage_raw = result.get("usage", {})
+        usage = usage_raw if isinstance(usage_raw, dict) else {}
+        n_tokens = _usage_int(usage, "completion_tokens", max(1, len(text.split())))
+        prompt_tokens = _usage_int(usage, "prompt_tokens", 0)
+        total_tokens = _usage_int(usage, "total_tokens", prompt_tokens + n_tokens)
+        tps = n_tokens / elapsed if elapsed > 0 else 0.0
+        total_tps = total_tokens / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "Generation: prompt=%d completion=%d total=%d in %.1fs "
+            "(decode %.2f tok/s, total %.2f tok/s)",
+            prompt_tokens,
+            n_tokens,
+            total_tokens,
+            elapsed,
+            tps,
+            total_tps,
+        )
         self._last_tps = tps
+        self._last_generation = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": n_tokens,
+            "total_tokens": total_tokens,
+            "elapsed_seconds": elapsed,
+            "decode_tps": tps,
+            "total_tps": total_tps,
+        }
 
         return text
 
@@ -364,11 +471,12 @@ class LlamaCppBackend:
         temperature: float = 1.0,
         top_p: float = 0.95,
         top_k: int = 40,
-        stop: Optional[List[str]] = None,
+        stop: list[str] | None = None,
     ) -> AsyncIterator[str]:
         """Generate text with streaming."""
         if not self._llm:
             raise RuntimeError("Backend not initialized")
+        llm = self._llm
 
         async with self._lock:
             loop = asyncio.get_event_loop()
@@ -376,7 +484,7 @@ class LlamaCppBackend:
             # Create completion in thread pool
             stream = await loop.run_in_executor(
                 None,
-                lambda: self._llm.create_completion(
+                lambda: llm.create_completion(
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
@@ -389,20 +497,37 @@ class LlamaCppBackend:
 
             # Stream tokens with TPS tracking
             t0 = time.perf_counter()
+            first_token_at: float | None = None
             n_tokens = 0
             for chunk in stream:
                 text = chunk["choices"][0].get("text", "")
                 if text:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
                     n_tokens += 1
                     yield text
                 await asyncio.sleep(0)  # Allow other tasks
 
             elapsed = time.perf_counter() - t0
-            tps = n_tokens / elapsed if elapsed > 0 else 0
-            logger.info("Stream: %d tokens in %.1fs (%.2f tok/s)", n_tokens, elapsed, tps)
+            tps = n_tokens / elapsed if elapsed > 0 else 0.0
+            first_token_seconds = first_token_at - t0 if first_token_at is not None else None
+            logger.info(
+                "Stream: %d chunks in %.1fs (%.2f chunk/s, first token %s)",
+                n_tokens,
+                elapsed,
+                tps,
+                f"{first_token_seconds:.2f}s" if first_token_seconds is not None else "n/a",
+            )
             self._last_tps = tps
+            self._last_generation = {
+                "completion_tokens": n_tokens,
+                "elapsed_seconds": elapsed,
+                "decode_tps": tps,
+                "first_token_seconds": first_token_seconds,
+                "streaming": True,
+            }
 
-    async def get_info(self) -> Dict[str, Any]:
+    async def get_info(self) -> dict[str, Any]:
         """Get model information."""
         if not self._llm:
             return {"status": "not_initialized"}
@@ -415,6 +540,8 @@ class LlamaCppBackend:
             "n_params": getattr(self._llm, "n_params", "unknown"),
             "model_path": str(self.model_path),
             "last_tps": self._last_tps,
+            "last_generation": self._last_generation,
+            "runtime_config": self._runtime_config,
         }
 
     async def cleanup(self) -> None:

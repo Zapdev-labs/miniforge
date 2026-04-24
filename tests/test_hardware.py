@@ -99,6 +99,7 @@ def test_auto_config_returns_dict() -> None:
     assert "n_threads" in config
     assert "n_batch" in config
     assert "quantization" in config
+    assert "memory_mode" in config
     assert config["n_threads"] > 0
 
 
@@ -114,6 +115,7 @@ def test_auto_config_wsl() -> None:
     assert config["use_mlock"] is False
     assert config["use_mmap"] is True
     assert config["is_moe"] is True
+    assert config["memory_mode"] == "paged_moe"
 
 
 def test_auto_config_memory_presets() -> None:
@@ -139,8 +141,52 @@ def test_recommend_optimizations_explains_settings() -> None:
     report = recommend_optimizations(model_params_b=7.0, profile=profile)
 
     assert report.tier == "balanced"
-    assert report.settings["n_threads"] == 12
+    assert report.settings["n_threads"] == 8
     assert report.settings["cpu_mask"] == "0-15"
     assert report.settings["n_gpu_layers"] > 0
+    assert report.settings["n_ctx"] == 32_768
+    assert report.settings["cache_type_k"] == "q8_0"
+    assert report.settings["memory_mode"] == "resident"
+    assert report.settings["use_mmap"] is False
     assert report.reasons
     assert report.to_dict()["settings"] == report.settings
+
+
+def test_small_dense_auto_config_avoids_giant_context() -> None:
+    """A 9B dense model should not use MiniMax-scale context by default."""
+    profile = HardwareProfile(
+        cpu=CpuInfo(physical_cores=8, logical_cores=16, flags=["avx", "avx2"]),
+        total_ram_gb=32.0,
+        available_ram_gb=20.0,
+        gpus=[],
+    )
+
+    config = auto_config(model_params_b=9.0, is_moe=False, profile=profile)
+
+    assert config["model_params_b"] == 9.0
+    assert config["is_moe"] is False
+    assert config["n_threads"] == 8
+    assert config["n_ctx"] == 32_768
+    assert config["n_batch"] == 4096
+    assert config["n_ubatch"] == 1024
+    assert config["cache_type_k"] == "q8_0"
+    assert config["memory_mode"] == "resident"
+    assert config["use_mmap"] is False
+
+
+def test_moe_auto_config_uses_disk_paging_mode() -> None:
+    """Huge MoE models should keep mmap/paged expert behavior."""
+    profile = HardwareProfile(
+        cpu=CpuInfo(physical_cores=8, logical_cores=16),
+        total_ram_gb=32.0,
+        available_ram_gb=20.0,
+        gpus=[],
+    )
+
+    config = auto_config(model_params_b=228.0, is_moe=True, profile=profile)
+
+    assert config["is_moe"] is True
+    assert config["memory_mode"] == "paged_moe"
+    assert config["use_mmap"] is True
+    assert config["use_mlock"] is False
+    assert config["n_batch"] <= 512

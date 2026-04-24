@@ -17,9 +17,122 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import psutil
+import psutil  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
+
+SMALL_DENSE_MAX_B = 12.0
+MEDIUM_DENSE_MAX_B = 34.0
+LARGE_DENSE_MAX_B = 80.0
+
+QUANT_BITS_PER_WEIGHT = {
+    "UD-TQ1_0": 1.0,
+    "UD-IQ1_S": 1.1,
+    "UD-IQ1_M": 1.2,
+    "UD-IQ2_XXS": 2.06,
+    "UD-IQ2_M": 2.3,
+    "UD-Q2_K_XL": 2.5,
+    "Q2_K": 2.5,
+    "UD-IQ3_XXS": 3.0,
+    "UD-IQ3_S": 3.1,
+    "UD-IQ3_K_S": 3.2,
+    "Q3_K": 3.4,
+    "Q3_K_S": 3.4,
+    "Q3_K_M": 3.4,
+    "UD-Q3_K_M": 3.4,
+    "UD-Q3_K_XL": 3.6,
+    "UD-IQ4_XS": 4.25,
+    "UD-Q4_K_S": 4.4,
+    "UD-Q4_NL": 4.4,
+    "UD-Q4_K_M": 4.5,
+    "UD-Q4_K_XL": 4.7,
+    "MXFP4_MOE": 4.5,
+    "Q4_K_M": 4.5,
+    "UD-Q5_K_S": 5.4,
+    "Q5_K_M": 5.5,
+    "UD-Q5_K_M": 5.5,
+    "UD-Q5_K_XL": 5.7,
+    "Q6_K": 6.5,
+    "UD-Q6_K": 6.5,
+    "UD-Q6_K_XL": 6.7,
+    "Q8_0": 8.0,
+    "UD-Q8_K_XL": 8.2,
+    "F16": 16.0,
+    "BF16": 16.0,
+}
+
+
+def _model_size_class(model_params_b: float, is_moe: bool) -> str:
+    """Classify model shape for runtime tuning."""
+    if is_moe:
+        return "moe"
+    if model_params_b <= SMALL_DENSE_MAX_B:
+        return "small_dense"
+    if model_params_b <= MEDIUM_DENSE_MAX_B:
+        return "medium_dense"
+    if model_params_b <= LARGE_DENSE_MAX_B:
+        return "large_dense"
+    return "huge_dense"
+
+
+def _estimated_model_gb(model_params_b: float, quantization: str) -> float:
+    """Estimate model weight size from quantization for residency decisions."""
+    bpw = QUANT_BITS_PER_WEIGHT.get(quantization, 4.5)
+    return (model_params_b * 1_000_000_000 * bpw) / (8 * 1024**3)
+
+
+def _dense_context_for_tier(model_class: str, ram_gb: float) -> int:
+    """Choose a default dense-model context that avoids wasting KV cache."""
+    if model_class == "small_dense":
+        if ram_gb >= 64:
+            return 65_536
+        if ram_gb >= 32:
+            return 32_768
+        if ram_gb >= 16:
+            return 16_384
+        return 8_192
+    if model_class == "medium_dense":
+        if ram_gb >= 64:
+            return 49_152
+        if ram_gb >= 32:
+            return 24_576
+        return 16_384
+    if model_class == "large_dense":
+        if ram_gb >= 64:
+            return 32_768
+        if ram_gb >= 32:
+            return 16_384
+        return 8_192
+    if ram_gb >= 64:
+        return 16_384
+    return 8_192
+
+
+def _batch_sizes_for_tier(model_class: str, ram_gb: float) -> tuple[int, int]:
+    """Choose prefill batch/micro-batch sizes by model and memory tier."""
+    if model_class == "small_dense":
+        if ram_gb >= 64:
+            return 8192, 1024
+        if ram_gb >= 32:
+            return 4096, 1024
+        if ram_gb >= 16:
+            return 2048, 512
+        return 1024, 256
+    if model_class == "medium_dense":
+        if ram_gb >= 64:
+            return 4096, 1024
+        if ram_gb >= 32:
+            return 2048, 512
+        return 1024, 256
+    if model_class == "large_dense":
+        if ram_gb >= 64:
+            return 2048, 512
+        return 1024, 256
+    if model_class == "moe":
+        if ram_gb >= 64:
+            return 1024, 512
+        return 512, 256
+    return 512, 256
 
 
 @dataclass
@@ -493,21 +606,30 @@ def recommend_optimizations(
     if profile is None:
         profile = detect_hardware()
 
-    config: dict[str, Any] = {}
+    model_class = _model_size_class(model_params_b, is_moe)
+    config: dict[str, Any] = {"model_params_b": model_params_b, "auto_context": True}
     reasons: list[str] = []
     warnings: list[str] = []
 
-    # Threads: physical cores for compute-bound inference
-    config["n_threads"] = max(1, profile.cpu.physical_cores)
-    # On systems with SMT, we can use logical cores for batch work
-    if profile.cpu.logical_cores > profile.cpu.physical_cores:
-        config["n_threads"] = max(1, profile.cpu.physical_cores + profile.cpu.physical_cores // 2)
+    # Threads: dense decode often gets slower when SMT oversubscribes memory bandwidth.
+    physical_cores = max(1, profile.cpu.physical_cores)
+    if model_class in {"small_dense", "medium_dense"}:
+        config["n_threads"] = physical_cores
+        reasons.append(
+            f"Using {physical_cores} physical inference threads for {model_class}; "
+            "dense decode is usually memory-bandwidth bound."
+        )
+    else:
+        config["n_threads"] = physical_cores
+        if profile.cpu.logical_cores > profile.cpu.physical_cores:
+            config["n_threads"] = max(1, physical_cores + physical_cores // 2)
+        reasons.append(
+            f"Using {config['n_threads']} inference threads from "
+            f"{profile.cpu.physical_cores} physical cores / "
+            f"{max(1, profile.cpu.logical_cores)} logical threads."
+        )
     logical_cores = max(1, profile.cpu.logical_cores)
     config["cpu_mask"] = f"0-{logical_cores - 1}" if logical_cores > 1 else "0"
-    reasons.append(
-        f"Using {config['n_threads']} inference threads from "
-        f"{profile.cpu.physical_cores} physical cores / {logical_cores} logical threads."
-    )
 
     # RAM-based safety
     total_ram = profile.total_ram_gb
@@ -525,30 +647,24 @@ def recommend_optimizations(
             "Available RAM is moderately low; close memory-heavy apps for longer context."
         )
 
-    # Batch sizes scale with available RAM
-    if total_ram >= 64:
-        config["n_batch"] = 4096
-        config["n_ubatch"] = 1024
-    elif total_ram >= 32:
-        config["n_batch"] = 2048
-        config["n_ubatch"] = 512
-    elif total_ram >= 16:
-        config["n_batch"] = 1024
-        config["n_ubatch"] = 512
-    else:
-        config["n_batch"] = 512
-        config["n_ubatch"] = 256
+    # Batch sizes scale with model class and available RAM.
+    n_batch, n_ubatch = _batch_sizes_for_tier(model_class, total_ram)
+    config["n_batch"] = n_batch
+    config["n_ubatch"] = n_ubatch
     if profile.memory_pressure == "high":
         config["n_batch"] = min(config["n_batch"], 512)
         config["n_ubatch"] = min(config["n_ubatch"], 256)
 
-    # Context window: aim high but safe
-    if total_ram >= 64:
-        config["n_ctx"] = 194_560
-    elif total_ram >= 32:
-        config["n_ctx"] = 98_304
+    # Context window: small dense models should not pay MiniMax-scale KV costs.
+    if model_class == "moe":
+        if total_ram >= 64:
+            config["n_ctx"] = 98_304
+        elif total_ram >= 32:
+            config["n_ctx"] = 65_536
+        else:
+            config["n_ctx"] = 32_768
     else:
-        config["n_ctx"] = 32_768
+        config["n_ctx"] = _dense_context_for_tier(model_class, total_ram)
     if profile.memory_pressure == "high":
         config["n_ctx"] = min(config["n_ctx"], 16_384)
     elif profile.memory_pressure == "medium":
@@ -561,10 +677,25 @@ def recommend_optimizations(
         f"on {total_ram:.1f}GB RAM."
     )
 
-    # KV cache: q4_0 is the safest aggressive default
-    config["cache_type_k"] = "q4_0"
-    config["cache_type_v"] = "q4_0"
-    reasons.append("Using q4_0 KV cache for broad llama.cpp compatibility and lower RAM use.")
+    # KV cache: avoid ultra-compressed KV for small dense models when RAM is available.
+    if model_class == "small_dense" and total_ram >= 64:
+        config["cache_type_k"] = "f16"
+        config["cache_type_v"] = "f16"
+        reasons.append("Using f16 KV cache for small dense model throughput on high-RAM hardware.")
+    elif model_class == "small_dense" and total_ram >= 16:
+        config["cache_type_k"] = "q8_0"
+        config["cache_type_v"] = "q8_0"
+        reasons.append("Using q8_0 KV cache for small dense model speed with moderate RAM use.")
+    elif model_class == "medium_dense" and total_ram >= 64:
+        config["cache_type_k"] = "q8_0"
+        config["cache_type_v"] = "q8_0"
+        reasons.append(
+            "Using q8_0 KV cache for medium dense model throughput on high-RAM hardware."
+        )
+    else:
+        config["cache_type_k"] = "q4_0"
+        config["cache_type_v"] = "q4_0"
+        reasons.append("Using q4_0 KV cache for broad llama.cpp compatibility and lower RAM use.")
 
     # CPU ISA
     config["use_avx"] = profile.cpu.has_avx
@@ -577,34 +708,59 @@ def recommend_optimizations(
     elif not profile.cpu.has_avx:
         warnings.append("AVX was not detected; CPU inference may be significantly slower.")
 
-    # OS-specific tweaks
+    # OS-specific baseline. Residency decisions below may disable mmap for small dense models.
+    config["use_mlock"] = False
+    config["use_mmap"] = True
     if profile.is_wsl:
-        config["use_mlock"] = False
-        config["use_mmap"] = True
         # WSL2 memory reclaim can be aggressive; be conservative
         config["max_memory_gb"] = max(4.0, total_ram * 0.65)
-        warnings.append(
-            "WSL detected; mmap enabled and mlock disabled for safer large-model paging."
-        )
-    elif profile.is_linux:
-        config["use_mlock"] = False  # Most users won't have unlimited memlock
+        warnings.append("WSL detected; memory target reduced and mlock disabled for safer paging.")
+
+    estimated_gb = _estimated_model_gb(model_params_b, config["quantization"])
+    if model_class == "moe":
+        config["memory_mode"] = "paged_moe"
         config["use_mmap"] = True
-    elif profile.is_windows or profile.is_darwin:
         config["use_mlock"] = False
+        reasons.append("MoE model detected; mmap keeps inactive experts paged from disk.")
+    elif profile.memory_pressure == "high":
+        config["memory_mode"] = "mmap"
         config["use_mmap"] = True
+        reasons.append("High memory pressure detected; using mmap instead of resident weights.")
+    else:
+        resident_fraction = 0.65 if model_class == "small_dense" else 0.45
+        resident_budget = min(config["max_memory_gb"] * resident_fraction, total_ram * 0.5)
+        if estimated_gb <= resident_budget:
+            config["memory_mode"] = "resident"
+            config["use_mmap"] = False
+            reasons.append(
+                f"Estimated {estimated_gb:.1f}GB weights fit resident memory budget; "
+                "loading dense weights into RAM to avoid per-token page faults."
+            )
+        else:
+            config["memory_mode"] = "mmap"
+            config["use_mmap"] = True
+            reasons.append(
+                f"Estimated {estimated_gb:.1f}GB weights exceed resident budget; using mmap."
+            )
 
     # GPU offloading
     config["n_gpu_layers"] = 0
     if profile.gpus:
         for gpu in profile.gpus:
             if gpu.vendor == "NVIDIA" and gpu.vram_gb >= 4.0:
-                config["n_gpu_layers"] = min(20, int(gpu.vram_gb * 3))
+                if estimated_gb <= gpu.vram_gb * 0.85 and model_class != "moe":
+                    config["n_gpu_layers"] = 999
+                else:
+                    config["n_gpu_layers"] = min(40, int(gpu.vram_gb * 4))
                 reasons.append(
                     f"Detected NVIDIA GPU with {gpu.vram_gb:.1f}GB VRAM; enabling partial layer offload."
                 )
                 break
             elif gpu.vendor == "AMD" and gpu.vram_gb >= 2.0:
-                config["n_gpu_layers"] = min(15, int(gpu.vram_gb * 3))
+                if estimated_gb <= gpu.vram_gb * 0.75 and model_class != "moe":
+                    config["n_gpu_layers"] = 999
+                else:
+                    config["n_gpu_layers"] = min(32, int(gpu.vram_gb * 3))
                 reasons.append(
                     f"Detected AMD GPU with {gpu.vram_gb:.1f}GB VRAM; enabling conservative offload."
                 )
@@ -624,7 +780,6 @@ def recommend_optimizations(
         config["use_mlock"] = False
         config["n_batch"] = min(config.get("n_batch", 2048), 512)
         config["n_ubatch"] = min(config.get("n_ubatch", 512), 256)
-        reasons.append("MoE model detected; mmap is required so inactive experts stay on disk.")
         if total_ram < 32:
             warnings.append(
                 "MoE model on under 32GB RAM depends heavily on fast local SSD/NVMe storage."

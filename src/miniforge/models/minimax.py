@@ -1,19 +1,19 @@
 """Main MiniMax model interface."""
 
-from typing import Optional, Union, List, Dict, AsyncIterator
-from pathlib import Path
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from pathlib import Path
 
 import psutil
 
 from miniforge.core.engine import InferenceEngine
 from miniforge.core.memory import MemoryManager
+from miniforge.generation.tools import Tool, ToolExecutor
 from miniforge.models.gguf_convert import auto_convert_safetensors_to_gguf
 from miniforge.models.registry import get_registry
-from miniforge.utils.config import M7Config
-from miniforge.generation.tools import Tool, ToolExecutor
 from miniforge.multimodal.vision import VisionProcessor
+from miniforge.utils.config import M7Config
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +40,9 @@ class Miniforge:
 
     def __init__(
         self,
-        model_path: Optional[Union[str, Path]] = None,
-        config: Optional[M7Config] = None,
-        backend: Optional[str] = None,
+        model_path: str | Path | None = None,
+        config: M7Config | None = None,
+        backend: str | None = None,
     ):
         """
         Initialize MiniMax model.
@@ -56,13 +56,13 @@ class Miniforge:
         self.model_path = model_path or self.DEFAULT_MODEL
         self.backend_name = backend or self.config.backend
 
-        self._engine: Optional[InferenceEngine] = None
+        self._engine: InferenceEngine | None = None
         total_ram = psutil.virtual_memory().total / (1024**3)
         target_util = self.config.max_memory_gb / total_ram if total_ram > 0 else 0.9
         self._memory_manager = MemoryManager(target_utilization=target_util)
         self._registry = get_registry(self.config.cache_dir)
-        self._tool_executor: Optional[ToolExecutor] = None
-        self._vision_processor: Optional[VisionProcessor] = None
+        self._tool_executor: ToolExecutor | None = None
+        self._vision_processor: VisionProcessor | None = None
 
         self._initialized = False
 
@@ -70,11 +70,11 @@ class Miniforge:
     async def from_pretrained(
         cls,
         model_id: str = "MiniMaxAI/MiniMax-M2.7",
-        quantization: Optional[str] = None,
-        config: Optional[M7Config] = None,
-        backend: Optional[str] = None,
-        cache_dir: Optional[str] = None,
-        download_dir: Optional[str] = None,
+        quantization: str | None = None,
+        config: M7Config | None = None,
+        backend: str | None = None,
+        cache_dir: str | None = None,
+        download_dir: str | None = None,
     ) -> "Miniforge":
         """
         Load model from HuggingFace or cache.
@@ -100,6 +100,8 @@ class Miniforge:
                     model_params_b=model_info.params_billions,
                     is_moe=model_info.is_moe,
                 )
+                config.model_id = model_id
+                config.model_params_b = model_info.params_billions
                 config.quantization = model_info.default_quantization
                 config.max_model_ctx = model_info.max_context
                 config.is_moe = model_info.is_moe
@@ -121,8 +123,8 @@ class Miniforge:
     @classmethod
     def from_gguf(
         cls,
-        gguf_path: Union[str, Path],
-        config: Optional[M7Config] = None,
+        gguf_path: str | Path,
+        config: M7Config | None = None,
     ) -> "Miniforge":
         """
         Load from local GGUF file.
@@ -137,7 +139,7 @@ class Miniforge:
         return cls(gguf_path, config, "llama_cpp")
 
     async def _load_model(
-        self, quantization: Optional[str] = None, download_dir: Optional[str] = None
+        self, quantization: str | None = None, download_dir: str | None = None
     ) -> None:
         """Load and prepare model."""
         model_id = str(self.model_path)
@@ -152,7 +154,7 @@ class Miniforge:
         model_info = self._registry.get_model_info(model_id)
 
         # Model architecture mapping: model_id -> n_layers
-        MODEL_ARCHITECTURE = {
+        model_architecture = {
             # MiniMax M2 series: 62 layers
             "MiniMax-M2": 62,
             "MiniMax-M2.1": 62,
@@ -189,7 +191,7 @@ class Miniforge:
         def get_n_layers(model_id: str) -> int:
             """Get number of layers for a model, with fallback to 62."""
             model_id_lower = model_id.lower()
-            for key, layers in MODEL_ARCHITECTURE.items():
+            for key, layers in model_architecture.items():
                 if key.lower() in model_id_lower:
                     return layers
             return 62  # Default fallback
@@ -197,18 +199,16 @@ class Miniforge:
         if model_info:
             params = model_info.params_billions
             # Propagate per-model metadata to config
+            self.config.model_params_b = params
             if model_info.max_context:
                 self.config.max_model_ctx = model_info.max_context
+            self.config.is_moe = model_info.is_moe
             if model_info.is_moe:
-                self.config.is_moe = True
                 # AirLLM-inspired: dynamically compute safe context from available RAM
                 # instead of a hardcoded 8192 that may waste memory or still be too large.
                 kv_type = self.config.cache_type_k
                 # If turbo3/turbo4 will fall back to q8_0, plan for that
-                if kv_type in ("turbo3", "turbo4"):
-                    effective_kv_type = "q4_0"
-                else:
-                    effective_kv_type = kv_type
+                effective_kv_type = "q4_0" if kv_type in ("turbo3", "turbo4") else kv_type
 
                 # Estimate GGUF disk size from param count + quant ratio
                 quant_bpw = {
@@ -598,13 +598,13 @@ class Miniforge:
     async def chat(
         self,
         message: str,
-        history: Optional[List[Dict[str, str]]] = None,
-        system_prompt: Optional[str] = None,
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        tools: Optional[List[Tool]] = None,
+        history: list[dict[str, str]] | None = None,
+        system_prompt: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        tools: list[Tool] | None = None,
         stream: bool = False,
-    ) -> Union[str, AsyncIterator[str]]:
+    ) -> str | AsyncIterator[str]:
         """
         Send a chat message.
 
@@ -701,13 +701,13 @@ class Miniforge:
 
     async def chat_messages(
         self,
-        messages: List[Dict[str, str]],
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        top_k: Optional[int] = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
         stream: bool = False,
-    ) -> Union[str, AsyncIterator[str]]:
+    ) -> str | AsyncIterator[str]:
         """Run chat completion from an OpenAI-style message list."""
         if not self._engine:
             raise RuntimeError("Model not initialized. Call initialize() first.")
@@ -731,8 +731,8 @@ class Miniforge:
     async def chat_vision(
         self,
         message: str,
-        image: Union[str, Path],
-        history: Optional[List[Dict[str, str]]] = None,
+        image: str | Path,
+        history: list[dict[str, str]] | None = None,
         **kwargs,
     ) -> str:
         """
@@ -768,10 +768,10 @@ class Miniforge:
     async def generate(
         self,
         prompt: str,
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
         stream: bool = False,
-    ) -> Union[str, AsyncIterator[str]]:
+    ) -> str | AsyncIterator[str]:
         """
         Raw text generation.
 
@@ -799,7 +799,7 @@ class Miniforge:
             **gen_params,
         )
 
-    def get_memory_stats(self) -> Dict[str, float]:
+    def get_memory_stats(self) -> dict[str, float]:
         """Get current memory usage statistics."""
         return self._memory_manager.get_stats().__dict__
 

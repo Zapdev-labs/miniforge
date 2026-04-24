@@ -106,6 +106,7 @@ class M7Config:
     # Model settings
     model_id: str = DEFAULT_MODEL_ID
     model_weights_path: str | None = None
+    model_params_b: float | None = None
     n_ctx: int = 194_560
     quantization: str = "UD-IQ2_XXS"
 
@@ -131,6 +132,8 @@ class M7Config:
     flash_attn: bool = True
     use_mmap: bool = True
     use_mlock: bool = False
+    memory_mode: str = "auto"
+    auto_context: bool = True
     rope_scaling_type: str | None = "linear"
     rope_freq_base: float = 10000.0
     rope_freq_scale: float = 1.0
@@ -164,7 +167,7 @@ class M7Config:
     verbose: bool = False
     log_level: str = "INFO"
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate configuration."""
         if self.n_ctx < 512:
             logger.warning("Context window %s very small, minimum 512 recommended", self.n_ctx)
@@ -207,6 +210,11 @@ class M7Config:
         if self.quantization not in valid_quants:
             logger.warning("Unknown quantization %s, using Q4_K_M", self.quantization)
             self.quantization = "Q4_K_M"
+
+        valid_memory_modes = ["auto", "resident", "mmap", "paged_moe"]
+        if self.memory_mode not in valid_memory_modes:
+            logger.warning("Unknown memory_mode %s, using auto", self.memory_mode)
+            self.memory_mode = "auto"
 
         valid_backends = ["llama_cpp", "transformers"]
         if self.backend not in valid_backends:
@@ -282,8 +290,27 @@ class M7Config:
     def from_env(cls, base: M7Config | None = None) -> M7Config:
         """Build a config from environment variables layered over auto config."""
         preset = os.environ.get("MINIFORGE_PRESET")
+        env_model_id = os.environ.get("MINIFORGE_MODEL", DEFAULT_MODEL_ID)
+        env_cache_dir = os.environ.get("MINIFORGE_CACHE_DIR")
         if base is None:
-            config = cls.performance_preset(preset) if preset else cls.auto()
+            if preset:
+                config = cls.performance_preset(preset)
+            else:
+                try:
+                    from miniforge.models.registry import get_registry
+
+                    model_info = get_registry(
+                        Path(env_cache_dir) if env_cache_dir else None
+                    ).get_model_info(env_model_id)
+                except Exception:
+                    model_info = None
+                if model_info is not None:
+                    config = cls.auto(
+                        model_params_b=model_info.params_billions,
+                        is_moe=model_info.is_moe,
+                    )
+                else:
+                    config = cls.auto()
         else:
             config = base
 
@@ -300,6 +327,15 @@ class M7Config:
             log_level=os.environ.get("MINIFORGE_LOG_LEVEL"),
             n_ctx=_read_int_env("MINIFORGE_N_CTX"),
             n_threads=_read_int_env("MINIFORGE_N_THREADS"),
+            n_batch=_read_int_env("MINIFORGE_N_BATCH"),
+            n_ubatch=_read_int_env("MINIFORGE_N_UBATCH"),
+            n_gpu_layers=_read_int_env("MINIFORGE_N_GPU_LAYERS"),
+            cache_type_k=os.environ.get("MINIFORGE_CACHE_TYPE_K"),
+            cache_type_v=os.environ.get("MINIFORGE_CACHE_TYPE_V"),
+            use_mmap=_read_bool_env("MINIFORGE_USE_MMAP"),
+            use_mlock=_read_bool_env("MINIFORGE_USE_MLOCK"),
+            auto_context=_read_bool_env("MINIFORGE_AUTO_CONTEXT"),
+            memory_mode=os.environ.get("MINIFORGE_MEMORY_MODE"),
             max_tokens=_read_int_env("MINIFORGE_MAX_TOKENS"),
             temperature=_read_float_env("MINIFORGE_TEMPERATURE"),
             top_p=_read_float_env("MINIFORGE_TOP_P"),
@@ -343,6 +379,7 @@ class M7Config:
         self.quantization = info.default_quantization
         self.max_model_ctx = info.max_context
         self.is_moe = info.is_moe
+        self.model_params_b = info.params_billions
         return self
 
     def apply_overrides(
@@ -360,6 +397,15 @@ class M7Config:
         log_level: str | None = None,
         n_ctx: int | None = None,
         n_threads: int | None = None,
+        n_batch: int | None = None,
+        n_ubatch: int | None = None,
+        n_gpu_layers: int | None = None,
+        cache_type_k: str | None = None,
+        cache_type_v: str | None = None,
+        use_mmap: bool | None = None,
+        use_mlock: bool | None = None,
+        auto_context: bool | None = None,
+        memory_mode: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
@@ -388,8 +434,27 @@ class M7Config:
             self.log_level = log_level
         if n_ctx is not None:
             self.n_ctx = n_ctx
+            self.auto_context = False
         if n_threads is not None:
             self.n_threads = n_threads
+        if n_batch is not None:
+            self.n_batch = n_batch
+        if n_ubatch is not None:
+            self.n_ubatch = n_ubatch
+        if n_gpu_layers is not None:
+            self.n_gpu_layers = n_gpu_layers
+        if cache_type_k is not None:
+            self.cache_type_k = cache_type_k
+        if cache_type_v is not None:
+            self.cache_type_v = cache_type_v
+        if use_mmap is not None:
+            self.use_mmap = use_mmap
+        if use_mlock is not None:
+            self.use_mlock = use_mlock
+        if auto_context is not None:
+            self.auto_context = auto_context
+        if memory_mode is not None:
+            self.memory_mode = memory_mode
         if max_tokens is not None:
             self.default_max_tokens = max_tokens
         if temperature is not None:
@@ -408,11 +473,14 @@ class M7Config:
             "model_id": self.model_id,
             "backend": self.backend,
             "quantization": self.quantization,
+            "model_params_b": self.model_params_b,
             "n_ctx": self.n_ctx,
             "n_threads": self.n_threads,
             "cache_type_k": self.cache_type_k,
             "cache_type_v": self.cache_type_v,
             "flash_attn": self.flash_attn,
+            "memory_mode": self.memory_mode,
+            "auto_context": self.auto_context,
             "download_dir": self.download_dir,
             "cache_dir": self.cache_dir,
             "model_weights_path": self.model_weights_path,
@@ -433,6 +501,8 @@ class M7Config:
             "flash_attn": self.flash_attn,
             "use_mmap": self.use_mmap,
             "use_mlock": self.use_mlock,
+            "memory_mode": self.memory_mode,
+            "auto_context": self.auto_context,
             "verbose": self.verbose,
             "n_gpu_layers": self.n_gpu_layers,
             "main_gpu": self.main_gpu,
@@ -458,6 +528,8 @@ class M7Config:
         config["rope_freq_scale"] = self.rope_freq_scale
         if self.max_model_ctx is not None:
             config["max_model_ctx"] = self.max_model_ctx
+        if self.model_params_b is not None:
+            config["model_params_b"] = self.model_params_b
         if self.is_moe:
             config["is_moe"] = True
         return config

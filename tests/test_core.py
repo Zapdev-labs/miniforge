@@ -92,6 +92,8 @@ def test_backend_config():
     assert "n_ctx" in backend_config
     assert "cache_type_k" in backend_config
     assert "flash_attn" in backend_config
+    assert backend_config["auto_context"] is True
+    assert backend_config["memory_mode"] == "auto"
 
 
 def test_generation_defaults():
@@ -115,6 +117,7 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINIFORGE_TEMPERATURE", "0.4")
     monkeypatch.setenv("MINIFORGE_MODEL_DIRS", "/models/a;/models/b")
     monkeypatch.setenv("MINIFORGE_OFFLINE", "1")
+    monkeypatch.setenv("MINIFORGE_N_CTX", "8192")
 
     config = M7Config.from_env()
 
@@ -125,6 +128,8 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.quantization == "UD-IQ2_XXS"
     assert config.model_dirs == ["/models/a", "/models/b"]
     assert config.offline is True
+    assert config.n_ctx == 8192
+    assert config.auto_context is False
 
 
 def test_config_summary() -> None:
@@ -149,6 +154,19 @@ def test_config_from_env_applies_known_model_metadata(monkeypatch: pytest.Monkey
     assert config.quantization == "UD-IQ2_XXS"
     assert config.is_moe is True
     assert config.max_model_ctx == 196_608
+    assert config.model_params_b == 228.0
+
+
+def test_model_metadata_flows_to_backend_config() -> None:
+    """Known model size should reach backend tuning diagnostics."""
+    config = M7Config(model_id="Qwen/Qwen3-8B")
+
+    config.apply_model_metadata()
+    backend_config = config.get_backend_config()
+
+    assert config.model_params_b == 8.0
+    assert backend_config["model_params_b"] == 8.0
+    assert config.is_moe is False
 
 
 @pytest.mark.asyncio
