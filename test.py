@@ -1,69 +1,86 @@
-"""Test script optimized for full 192K context on GMKtech M7 with AMD Ryzen 7 PRO 6850H.
+"""Quick local Gemma GGUF smoke test using llama-cpp-python."""
 
-Performance optimizations:
-- Full 192K context window (194,560 tokens)
-- Larger batch sizes for better throughput (n_batch=2048)
-- TurboQuant 3-bit KV cache compression
-- Flash Attention enabled
-- Optimized for AMD Ryzen 8-core CPU
-"""
+from __future__ import annotations
 
-import asyncio
-import logging
-from miniforge import Miniforge
-from miniforge.utils.config import M7Config
+import argparse
+import time
+from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+from llama_cpp import Llama
+
+DEFAULT_MODEL_DIR = Path(r"D:\AI\models\freakyskittle\gemma-4-9b-it-Q2_K")
 
 
-async def main():
-    # Optimized configuration for full 192K context
-    config = M7Config(
-        quantization="UD-IQ2_XXS",
-        cache_type_k="turbo3",
-        cache_type_v="turbo3",
-        n_ctx=194_560,
-        n_threads=8,
-        n_batch=2048,
-        n_ubatch=512,
-        n_gpu_layers=0,
+def find_gguf(model_dir: Path) -> Path:
+    """Return the first GGUF file in a model directory."""
+    if model_dir.is_file() and model_dir.suffix.lower() == ".gguf":
+        return model_dir
+
+    gguf_files = sorted(model_dir.glob("*.gguf"))
+    if not gguf_files:
+        raise FileNotFoundError(f"No .gguf files found in {model_dir}")
+    return gguf_files[0]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run a quick Gemma GGUF generation test.")
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--prompt", default="Write a short hello from Gemma in one paragraph.")
+    parser.add_argument("--ctx", type=int, default=8192)
+    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--batch", type=int, default=512)
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--gpu-layers", type=int, default=0)
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    model_path = find_gguf(args.model)
+
+    print(f"Loading Gemma GGUF: {model_path}")
+    llm = Llama(
+        model_path=str(model_path),
+        n_ctx=args.ctx,
+        n_threads=args.threads,
+        n_batch=args.batch,
+        n_gpu_layers=args.gpu_layers,
         flash_attn=True,
         use_mmap=True,
-        verbose=True,
+        verbose=args.verbose,
     )
 
-    print("Loading MiniMax M2.7 with 192K context optimization...")
-    print(f"Configuration: ctx={config.n_ctx}, batch={config.n_batch}, threads={config.n_threads}")
+    print("\nPrompt:")
+    print(args.prompt)
+    print("\nResponse:")
 
-    # Load model from unsloth GGUF repository
-    model = await Miniforge.from_pretrained(
-        "unsloth/MiniMax-M2.7-GGUF",
-        quantization=config.quantization,
-        config=config,
-        cache_dir=".",
+    stream = llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": "You are a concise, helpful assistant."},
+            {"role": "user", "content": args.prompt},
+        ],
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        stream=True,
     )
 
-    print("Model loaded!")
+    start_time = time.perf_counter()
+    generated_tokens = 0
+    for chunk in stream:
+        delta = chunk["choices"][0].get("delta", {})
+        text = delta.get("content") or ""
+        if text:
+            generated_tokens += 1
+            print(text, end="", flush=True)
 
-    # Simple chat
-    response = await model.chat(
-        "Explain quantum computing",
-        system_prompt="You are a helpful assistant.",
-    )
-    print(response)
-
-    # Streaming
-    print("\nStreaming response:")
-    stream = await model.chat("Tell me a story", stream=True)
-    async for token in stream:
-        print(token, end="", flush=True)
-    print()
-
-    # Cleanup
-    await model.cleanup()
+    elapsed = time.perf_counter() - start_time
+    tps = generated_tokens / elapsed if elapsed > 0 else 0.0
+    print(f"\n\nTPS: {tps:.2f} tokens/sec ({generated_tokens} tokens in {elapsed:.2f}s)")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
