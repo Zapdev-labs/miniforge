@@ -150,6 +150,35 @@ def _auto_dense_context_limit(model_params_b: float) -> int:
     return 8_192
 
 
+def _apply_hardware_auto_tuning(
+    config: dict[str, Any], model_params_b: float | None, is_moe: bool
+) -> None:
+    """Fill default backend settings from hardware detection for direct GGUF usage."""
+    if not bool(config.get("auto_context", True)) or model_params_b is None:
+        return
+
+    try:
+        from miniforge.utils.config import M7Config
+        from miniforge.utils.hardware import auto_config
+    except Exception as exc:
+        logger.debug("Hardware auto-tuning unavailable: %s", exc)
+        return
+
+    defaults = M7Config().get_backend_config()
+    try:
+        tuned = auto_config(model_params_b=model_params_b, is_moe=is_moe)
+    except Exception as exc:
+        logger.debug("Hardware auto-tuning failed: %s", exc)
+        return
+
+    for key, tuned_value in tuned.items():
+        if key in {"n_ctx", "model_params_b", "is_moe"}:
+            continue
+        current_value = config.get(key)
+        if key not in config or current_value == defaults.get(key):
+            config[key] = tuned_value
+
+
 def _usage_int(usage: dict[str, Any], key: str, default: int) -> int:
     value = usage.get(key, default)
     if isinstance(value, int):
@@ -197,6 +226,7 @@ class LlamaCppBackend:
             else _infer_model_params_from_path(self.model_path)
         )
         is_moe = bool(self.config.get("is_moe", False))
+        _apply_hardware_auto_tuning(self.config, model_params_b, is_moe)
         if (
             bool(self.config.get("auto_context", True))
             and model_params_b is not None

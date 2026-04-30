@@ -169,6 +169,57 @@ def test_model_metadata_flows_to_backend_config() -> None:
     assert config.is_moe is False
 
 
+def test_llama_backend_auto_tunes_default_backend_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct GGUF configs should inherit hardware tuning for default backend values."""
+    from miniforge.core.backends.llama_cpp import _apply_hardware_auto_tuning
+
+    def fake_auto_config(model_params_b: float, is_moe: bool) -> dict[str, object]:
+        assert model_params_b == 4.0
+        assert is_moe is False
+        return {
+            "n_ctx": 32_768,
+            "n_threads": 12,
+            "n_batch": 4096,
+            "n_ubatch": 1024,
+            "cache_type_k": "q8_0",
+            "cache_type_v": "q8_0",
+            "use_mmap": False,
+            "memory_mode": "resident",
+        }
+
+    monkeypatch.setattr("miniforge.utils.hardware.auto_config", fake_auto_config)
+    config = M7Config(n_ctx=4096, quantization="Q4_K_M").get_backend_config()
+
+    _apply_hardware_auto_tuning(config, model_params_b=4.0, is_moe=False)
+
+    assert config["n_ctx"] == 4096
+    assert config["n_threads"] == 12
+    assert config["n_batch"] == 4096
+    assert config["cache_type_k"] == "q8_0"
+    assert config["use_mmap"] is False
+    assert config["memory_mode"] == "resident"
+
+
+def test_llama_backend_auto_tuning_preserves_explicit_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-default caller choices should not be overwritten by auto tuning."""
+    from miniforge.core.backends.llama_cpp import _apply_hardware_auto_tuning
+
+    monkeypatch.setattr(
+        "miniforge.utils.hardware.auto_config",
+        lambda model_params_b, is_moe: {"n_threads": 12, "cache_type_k": "q8_0"},
+    )
+    config = M7Config(n_threads=6, cache_type_k="f16").get_backend_config()
+
+    _apply_hardware_auto_tuning(config, model_params_b=4.0, is_moe=False)
+
+    assert config["n_threads"] == 6
+    assert config["cache_type_k"] == "f16"
+
+
 @pytest.mark.asyncio
 async def test_engine_initialization_mock():
     """Mock test for engine initialization."""
