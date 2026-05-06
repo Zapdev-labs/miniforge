@@ -1,5 +1,7 @@
 """Test core functionality."""
 
+from pathlib import Path
+
 import pytest
 
 from miniforge.core.memory import MemoryManager, MemoryStats
@@ -169,6 +171,36 @@ def test_model_metadata_flows_to_backend_config() -> None:
     assert config.is_moe is False
 
 
+def test_speed_preset_uses_throughput_defaults() -> None:
+    """Speed preset should prioritize deterministic throughput settings."""
+    config = M7Config.performance_preset("speed")
+
+    assert config.cache_type_k == "q8_0"
+    assert config.cache_type_v == "q8_0"
+    assert config.default_temperature == 0.0
+    assert config.default_top_p == 1.0
+    assert config.default_top_k == 1
+    assert config.repeat_penalty == 1.05
+
+
+def test_config_from_env_includes_sampling_tuning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sampling knobs should be configurable via env and flow to backend config."""
+    monkeypatch.setenv("MINIFORGE_TOP_K", "24")
+    monkeypatch.setenv("MINIFORGE_MIN_P", "0.08")
+    monkeypatch.setenv("MINIFORGE_REPEAT_PENALTY", "1.02")
+    monkeypatch.setenv("MINIFORGE_SEED", "123")
+    monkeypatch.setenv("MINIFORGE_N_THREADS_BATCH", "14")
+
+    config = M7Config.from_env()
+    backend_config = config.get_backend_config()
+
+    assert config.default_top_k == 24
+    assert config.min_p == 0.08
+    assert config.repeat_penalty == 1.02
+    assert backend_config["seed"] == 123
+    assert backend_config["n_threads_batch"] == 14
+
+
 def test_llama_backend_auto_tunes_default_backend_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -200,6 +232,7 @@ def test_llama_backend_auto_tunes_default_backend_settings(
     assert config["cache_type_k"] == "q8_0"
     assert config["use_mmap"] is False
     assert config["memory_mode"] == "resident"
+    assert config["n_threads_batch"] is None
 
 
 def test_llama_backend_auto_tuning_preserves_explicit_values(
@@ -218,6 +251,56 @@ def test_llama_backend_auto_tuning_preserves_explicit_values(
 
     assert config["n_threads"] == 6
     assert config["cache_type_k"] == "f16"
+
+
+def test_filter_supported_kwargs_drops_unknown() -> None:
+    """Unknown kwargs should be filtered for callables without **kwargs."""
+    from miniforge.core.backends.llama_cpp import _filter_supported_kwargs
+
+    def sample_fn(alpha: int, beta: int) -> int:
+        return alpha + beta
+
+    filtered = _filter_supported_kwargs(sample_fn, {"alpha": 1, "beta": 2, "gamma": 3})
+    assert filtered == {"alpha": 1, "beta": 2}
+
+
+def test_llama_completion_kwargs_sync_stream_parity() -> None:
+    """Sync and stream should share identical decoding knobs except stream flag."""
+    from miniforge.core.backends.llama_cpp import LlamaCppBackend
+
+    backend = LlamaCppBackend(
+        model_path=Path("model.gguf"),
+        config={
+            "min_p": 0.05,
+            "repeat_penalty": 1.01,
+            "seed": 7,
+            "speculative_n_max": 10,
+        },
+    )
+    sync_kwargs = backend._build_completion_kwargs(
+        prompt="hi",
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=1,
+        stop=["x"],
+        stream=False,
+    )
+    stream_kwargs = backend._build_completion_kwargs(
+        prompt="hi",
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=1,
+        stop=["x"],
+        stream=True,
+    )
+
+    assert {k: v for k, v in sync_kwargs.items() if k != "stream"} == {
+        k: v for k, v in stream_kwargs.items() if k != "stream"
+    }
+    assert sync_kwargs["stream"] is False
+    assert stream_kwargs["stream"] is True
 
 
 @pytest.mark.asyncio

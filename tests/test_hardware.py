@@ -141,11 +141,12 @@ def test_recommend_optimizations_explains_settings() -> None:
     report = recommend_optimizations(model_params_b=7.0, profile=profile)
 
     assert report.tier == "balanced"
-    assert report.settings["n_threads"] == 8
+    assert report.settings["n_threads"] == 12
+    assert report.settings["n_threads_batch"] == 16
     assert report.settings["cpu_mask"] == "0-15"
     assert report.settings["n_gpu_layers"] > 0
     assert report.settings["n_ctx"] == 32_768
-    assert report.settings["cache_type_k"] == "q8_0"
+    assert report.settings["cache_type_k"] == "f16"
     assert report.settings["memory_mode"] == "resident"
     assert report.settings["use_mmap"] is False
     assert report.reasons
@@ -165,11 +166,12 @@ def test_small_dense_auto_config_avoids_giant_context() -> None:
 
     assert config["model_params_b"] == 9.0
     assert config["is_moe"] is False
-    assert config["n_threads"] == 8
+    assert config["n_threads"] == 12
+    assert config["n_threads_batch"] == 16
     assert config["n_ctx"] == 32_768
     assert config["n_batch"] == 4096
     assert config["n_ubatch"] == 1024
-    assert config["cache_type_k"] == "q8_0"
+    assert config["cache_type_k"] == "f16"
     assert config["memory_mode"] == "resident"
     assert config["use_mmap"] is False
 

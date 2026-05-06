@@ -2,10 +2,12 @@
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import re
 import time
 from collections.abc import AsyncIterator
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -14,60 +16,47 @@ logger = logging.getLogger(__name__)
 MAX_MINIMAX_TRAINED_CTX = 196_608  # MiniMax trained context window
 CTX_SAFETY_HEADROOM = 2_048  # Reserve for generation
 DEFAULT_OPTIMAL_CTX = 194_560  # 192K usable context (196608 - 2048)
+GGML_TYPE_MAP: dict[str, int] = {
+    "F32": 0,
+    "F16": 1,
+    "Q4_0": 2,
+    "Q4_1": 3,
+    "Q5_0": 6,
+    "Q5_1": 7,
+    "Q8_0": 8,
+    "Q8_1": 9,
+    "Q2_K": 10,
+    "Q3_K": 11,
+    "Q4_K": 12,
+    "Q5_K": 13,
+    "Q6_K": 14,
+    "IQ4_NL": 20,
+}
+KV_ALIAS_MAP: dict[str, str] = {
+    "f16": "F16",
+    "fp16": "F16",
+    "f32": "F32",
+    "fp32": "F32",
+    "q8_0": "Q8_0",
+    "q5_0": "Q5_0",
+    "q5_1": "Q5_1",
+    "q4_0": "Q4_0",
+    "q4_1": "Q4_1",
+}
+KV_FALLBACK_CHAINS: dict[str, list[str]] = {
+    "turbo3": ["q4_0", "q8_0"],
+    "turbo4": ["q4_0", "q8_0"],
+}
 
 
 def _resolve_kv_cache_types(cache_type_k: Any, cache_type_v: Any) -> tuple[int | None, int | None]:
-    """
-    Convert user-friendly KV cache type values to llama-cpp enum ints.
-
-    Newer llama-cpp builds require integer ggml type enums for type_k/type_v.
-    Falls back through a chain: turbo3 -> q4_0 -> q8_0 -> None (f16 default).
-    """
-    # Hardcoded ggml_type enum values — used when the Python binding
-    # doesn't expose GGMLType (older llama-cpp-python builds).
-    # Values from ggml/include/ggml.h enum ggml_type.
-    ggml_type_map: dict[str, int] = {
-        "F32": 0,
-        "F16": 1,
-        "Q4_0": 2,
-        "Q4_1": 3,
-        "Q5_0": 6,
-        "Q5_1": 7,
-        "Q8_0": 8,
-        "Q8_1": 9,
-        "Q2_K": 10,
-        "Q3_K": 11,
-        "Q4_K": 12,
-        "Q5_K": 13,
-        "Q6_K": 14,
-        "IQ4_NL": 20,
-    }
-
-    # Try runtime enum first, fall back to hardcoded map
+    """Convert user-facing KV cache names to llama-cpp enum values."""
     try:
         import llama_cpp
 
         ggml_enum = getattr(llama_cpp, "GGMLType", None)
     except Exception:
         ggml_enum = None
-
-    alias_map: dict[str, str] = {
-        "f16": "F16",
-        "fp16": "F16",
-        "f32": "F32",
-        "fp32": "F32",
-        "q8_0": "Q8_0",
-        "q5_0": "Q5_0",
-        "q5_1": "Q5_1",
-        "q4_0": "Q4_0",
-        "q4_1": "Q4_1",
-    }
-
-    # Fallback chain for aggressive cache types that may not be supported
-    fallback_chains: dict[str, list[str]] = {
-        "turbo3": ["q4_0", "q8_0"],
-        "turbo4": ["q4_0", "q8_0"],
-    }
 
     def _convert(value: Any) -> int | None:
         if value is None:
@@ -79,13 +68,11 @@ def _resolve_kv_cache_types(cache_type_k: Any, cache_type_v: Any) -> tuple[int |
 
         normalized = value.strip().lower()
 
-        # Build candidate list: requested type first, then fallbacks
-        candidates = [normalized] + fallback_chains.get(normalized, [])
+        candidates = [normalized] + KV_FALLBACK_CHAINS.get(normalized, [])
 
         for candidate in candidates:
-            enum_name = alias_map.get(candidate, candidate.upper())
+            enum_name = KV_ALIAS_MAP.get(candidate, candidate.upper())
 
-            # Try runtime enum first
             if ggml_enum is not None:
                 enum_value = getattr(ggml_enum, enum_name, None)
                 if enum_value is not None:
@@ -93,11 +80,10 @@ def _resolve_kv_cache_types(cache_type_k: Any, cache_type_v: Any) -> tuple[int |
                         logger.info("KV cache: '%s' -> '%s' (via runtime enum)", value, candidate)
                     return int(enum_value)
 
-            # Fall back to hardcoded values
-            if enum_name in ggml_type_map:
+            if enum_name in GGML_TYPE_MAP:
                 if candidate != normalized:
                     logger.info("KV cache: '%s' -> '%s' (via hardcoded enum)", value, candidate)
-                return ggml_type_map[enum_name]
+                return GGML_TYPE_MAP[enum_name]
 
         return None
 
@@ -188,6 +174,38 @@ def _usage_int(usage: dict[str, Any], key: str, default: int) -> int:
     return default
 
 
+def _supports_kwargs(callable_obj: Any) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _filter_supported_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Filter keyword arguments to those accepted by callable_obj."""
+    if _supports_kwargs(callable_obj):
+        return kwargs
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return kwargs
+    accepted = set(signature.parameters.keys())
+    filtered: dict[str, Any] = {}
+    dropped: list[str] = []
+    for key, value in kwargs.items():
+        if key in accepted:
+            filtered[key] = value
+        else:
+            dropped.append(key)
+    if dropped:
+        logger.debug("Dropping unsupported llama-cpp kwargs: %s", ", ".join(sorted(dropped)))
+    return filtered
+
+
 class LlamaCppBackend:
     """
     Backend using llama-cpp-python for optimized CPU inference.
@@ -208,6 +226,46 @@ class LlamaCppBackend:
         self._last_generation: dict[str, Any] = {}
         self._runtime_config: dict[str, Any] = {}
 
+    def _build_completion_kwargs(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        stop: list[str] | None,
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "stop": stop or [],
+            "stream": stream,
+        }
+        optional_generation: dict[str, Any] = {
+            "min_p": self.config.get("min_p"),
+            "typical_p": self.config.get("typical_p"),
+            "repeat_penalty": self.config.get("repeat_penalty"),
+            "presence_penalty": self.config.get("presence_penalty"),
+            "frequency_penalty": self.config.get("frequency_penalty"),
+            "mirostat_mode": self.config.get("mirostat_mode"),
+            "mirostat_tau": self.config.get("mirostat_tau"),
+            "mirostat_eta": self.config.get("mirostat_eta"),
+            "seed": self.config.get("seed"),
+            "tfs_z": self.config.get("tfs_z"),
+            "speculative_n_max": self.config.get("speculative_n_max"),
+            "speculative_n_min": self.config.get("speculative_n_min"),
+            "speculative_p_min": self.config.get("speculative_p_min"),
+        }
+        for key, value in optional_generation.items():
+            if value is not None:
+                kwargs[key] = value
+        return kwargs
+
     async def initialize(self) -> None:
         """Initialize the Llama model with performance optimizations."""
         try:
@@ -217,7 +275,6 @@ class LlamaCppBackend:
                 "llama-cpp-python not installed. Install with: uv pip install llama-cpp-python"
             ) from exc
 
-        # Extract configuration with M7-optimized defaults for full 192K context
         requested_n_ctx = int(self.config.get("n_ctx", DEFAULT_OPTIMAL_CTX))
         model_params_raw = self.config.get("model_params_b")
         model_params_b = (
@@ -242,7 +299,6 @@ class LlamaCppBackend:
                     auto_limit,
                 )
                 requested_n_ctx = auto_limit
-        # Per-model context cap: MiniMax=196K, Kimi K2.5=262K, others use MiniMax default
         model_max_ctx = int(self.config.get("max_model_ctx", MAX_MINIMAX_TRAINED_CTX))
         max_safe_ctx = model_max_ctx - CTX_SAFETY_HEADROOM
         n_ctx = min(requested_n_ctx, max_safe_ctx)
@@ -254,28 +310,20 @@ class LlamaCppBackend:
                 n_ctx,
             )
 
-        # CPU/GPU settings
         n_threads = self.config.get("n_threads", 8)
-        n_batch = self.config.get("n_batch", 2048)  # Larger batch for 192K context
-        n_ubatch = self.config.get("n_ubatch", 512)  # Micro-batch for chunked processing
+        n_batch = self.config.get("n_batch", 2048)
+        n_ubatch = self.config.get("n_ubatch", 512)
         n_gpu_layers = self.config.get("n_gpu_layers", 0)
         main_gpu = self.config.get("main_gpu", 0)
 
-        # KV cache quantization (TurboQuant - aggressive compression for 192K)
         cache_type_k = self.config.get("cache_type_k", "turbo3")
         cache_type_v = self.config.get("cache_type_v", "turbo3")
 
-        # Performance features
         flash_attn = self.config.get("flash_attn", True)
 
-        # Memory mapping (optimize for large context)
         use_mmap = self.config.get("use_mmap", True)
         use_mlock = self.config.get("use_mlock", False)
 
-        # MoE models: mmap is the mechanism that makes them runnable on limited RAM.
-        # Force mmap=True and mlock=False — locking 240+ GB in RAM would crash the system.
-        # AirLLM-inspired: also reduce batch sizes to minimize peak memory pressure,
-        # letting the OS page-cache hold more active expert weights in RAM.
         memory_mode = str(self.config.get("memory_mode", "auto"))
         if memory_mode == "resident" and not is_moe:
             use_mmap = False
@@ -287,7 +335,6 @@ class LlamaCppBackend:
         if is_moe:
             use_mmap = True
             use_mlock = False
-            # Smaller batches = less peak memory during prefill = more RAM for expert pages
             n_batch = min(n_batch, 512)
             n_ubatch = min(n_ubatch, 256)
             if n_ctx > 32_768:
@@ -297,15 +344,14 @@ class LlamaCppBackend:
                     n_ctx,
                 )
 
-        # RoPE settings for long context
         rope_freq_base = self.config.get("rope_freq_base", 10000.0)
         rope_freq_scale = self.config.get("rope_freq_scale", 1.0)
 
-        logger.info(f"Loading model from {self.model_path}")
-        logger.info(f"Context: {n_ctx} tokens (model max: {model_max_ctx})")
-        logger.info(f"Threads: {n_threads}, Batch: {n_batch}/{n_ubatch}")
-        logger.info(f"Memory mode: {memory_mode}, mmap={use_mmap}, mlock={use_mlock}")
-        logger.info(f"KV cache: k={cache_type_k}, v={cache_type_v}, FlashAttn={flash_attn}")
+        logger.info("Loading model from %s", self.model_path)
+        logger.info("Context: %s tokens (model max: %s)", n_ctx, model_max_ctx)
+        logger.info("Threads: %s, Batch: %s/%s", n_threads, n_batch, n_ubatch)
+        logger.info("Memory mode: %s, mmap=%s, mlock=%s", memory_mode, use_mmap, use_mlock)
+        logger.info("KV cache: k=%s, v=%s, FlashAttn=%s", cache_type_k, cache_type_v, flash_attn)
         if is_moe:
             logger.info(
                 "MoE model: mmap=True, mlock=False, batch=%d/%d (active experts paged from disk)",
@@ -313,10 +359,9 @@ class LlamaCppBackend:
                 n_ubatch,
             )
         if n_gpu_layers > 0:
-            logger.info(f"GPU layers: {n_gpu_layers} on device {main_gpu}")
+            logger.info("GPU layers: %s on device %s", n_gpu_layers, main_gpu)
 
-        # Build kwargs for Llama with all optimizations
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "model_path": str(self.model_path),
             "n_ctx": n_ctx,
             "n_threads": n_threads,
@@ -328,16 +373,24 @@ class LlamaCppBackend:
             "rope_freq_scale": rope_freq_scale,
             "chat_format": self.config.get("chat_format", None),
         }
+        optional_init_kwargs: dict[str, Any] = {
+            "n_threads_batch": self.config.get("n_threads_batch"),
+            "numa": self.config.get("numa"),
+            "seed": self.config.get("seed"),
+            "offload_kqv": self.config.get("offload_kqv"),
+            "mul_mat_q": self.config.get("mul_mat_q"),
+            "f16_kv": self.config.get("f16_kv"),
+        }
+        for key, value in optional_init_kwargs.items():
+            if value is not None:
+                kwargs[key] = value
 
-        # Add micro-batch size if supported (helps with 192K context)
         if n_ubatch != n_batch:
             kwargs["n_ubatch"] = n_ubatch
 
-        # Flash Attention - critical for 192K context performance
         if flash_attn:
             kwargs["flash_attn"] = flash_attn
 
-        # KV cache types (TurboQuant for memory efficiency)
         type_k, type_v = _resolve_kv_cache_types(cache_type_k, cache_type_v)
         if type_k is not None:
             kwargs["type_k"] = type_k
@@ -354,17 +407,13 @@ class LlamaCppBackend:
                 cache_type_v,
             )
 
-        # GPU layers (for AMD iGPU or discrete GPU)
         if n_gpu_layers > 0:
             kwargs["n_gpu_layers"] = n_gpu_layers
             kwargs["main_gpu"] = main_gpu
             if "tensor_split" in self.config:
                 kwargs["tensor_split"] = self.config["tensor_split"]
 
-        # Patch Jinja2 to support {% break %}/{% continue %} used by some GGUF chat
-        # templates (e.g. Kimi K2.5). llama-cpp-python's Jinja2ChatFormatter creates an
-        # ImmutableSandboxedEnvironment without loopcontrols, so we patch Environment.__init__
-        # to inject the extension automatically.
+        _orig_env_init: Any | None = None
         try:
             import jinja2
 
@@ -382,19 +431,20 @@ class LlamaCppBackend:
         except Exception:
             pass
 
-        # Initialize in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         init_errors: list[str] = []
         initialized_ctx: int | None = None
         initialized_batch: int | None = None
         try:
             for candidate_ctx in _context_fallbacks(requested_n_ctx, max_safe_ctx):
-                kwargs["n_ctx"] = candidate_ctx
-                kwargs["n_batch"] = min(n_batch, candidate_ctx)
+                candidate_kwargs = dict(kwargs)
+                candidate_kwargs["n_ctx"] = candidate_ctx
+                candidate_kwargs["n_batch"] = min(n_batch, candidate_ctx)
+                candidate_kwargs = _filter_supported_kwargs(Llama, candidate_kwargs)
                 try:
-                    self._llm = await loop.run_in_executor(None, lambda: Llama(**kwargs))
+                    self._llm = await loop.run_in_executor(None, partial(Llama, **candidate_kwargs))
                     initialized_ctx = candidate_ctx
-                    initialized_batch = int(kwargs["n_batch"])
+                    initialized_batch = int(candidate_kwargs["n_batch"])
                     if candidate_ctx != n_ctx:
                         logger.warning(
                             "Initialized with fallback n_ctx=%s after allocation failure at higher context",
@@ -406,10 +456,19 @@ class LlamaCppBackend:
                     init_errors.append(f"n_ctx={candidate_ctx}: {message}")
                     logger.warning("Llama init failed with n_ctx=%s: %s", candidate_ctx, message)
                     continue
+                except TypeError as exc:
+                    message = str(exc)
+                    init_errors.append(f"n_ctx={candidate_ctx}: {message}")
+                    logger.warning(
+                        "Llama init rejected kwarg set at n_ctx=%s: %s",
+                        candidate_ctx,
+                        message,
+                    )
+                    continue
         finally:
-            # Restore original Environment.__init__ to avoid side effects
-            with contextlib.suppress(Exception):
-                jinja2.Environment.__init__ = _orig_env_init  # type: ignore[method-assign] # noqa: F821
+            if _orig_env_init is not None:
+                with contextlib.suppress(Exception):
+                    jinja2.Environment.__init__ = _orig_env_init  # type: ignore[method-assign]
 
         if self._llm is None:
             errors = "; ".join(init_errors) if init_errors else "unknown initialization error"
@@ -449,17 +508,23 @@ class LlamaCppBackend:
         llm = self._llm
 
         async with self._lock:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             t0 = time.perf_counter()
             result = await loop.run_in_executor(
                 None,
                 lambda: llm.create_completion(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    stop=stop or [],
+                    **_filter_supported_kwargs(
+                        llm.create_completion,
+                        self._build_completion_kwargs(
+                            prompt=prompt,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                            stop=stop,
+                            stream=False,
+                        ),
+                    )
                 ),
             )
             elapsed = time.perf_counter() - t0
@@ -509,23 +574,25 @@ class LlamaCppBackend:
         llm = self._llm
 
         async with self._lock:
-            loop = asyncio.get_event_loop()
-
-            # Create completion in thread pool
+            loop = asyncio.get_running_loop()
             stream = await loop.run_in_executor(
                 None,
                 lambda: llm.create_completion(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    stop=stop or [],
-                    stream=True,
+                    **_filter_supported_kwargs(
+                        llm.create_completion,
+                        self._build_completion_kwargs(
+                            prompt=prompt,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                            stop=stop,
+                            stream=True,
+                        ),
+                    )
                 ),
             )
 
-            # Stream tokens with TPS tracking
             t0 = time.perf_counter()
             first_token_at: float | None = None
             n_tokens = 0
@@ -536,7 +603,7 @@ class LlamaCppBackend:
                         first_token_at = time.perf_counter()
                     n_tokens += 1
                     yield text
-                await asyncio.sleep(0)  # Allow other tasks
+                await asyncio.sleep(0)
 
             elapsed = time.perf_counter() - t0
             tps = n_tokens / elapsed if elapsed > 0 else 0.0

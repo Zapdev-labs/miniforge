@@ -71,10 +71,7 @@ def _run_hf_to_gguf(convert_script: Path, model_dir: Path, outfile: Path, outtyp
     logger.info("Running llama.cpp convert_hf_to_gguf (can take several minutes)...")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(
-            "convert_hf_to_gguf failed:\n"
-            f"{proc.stdout}\n{proc.stderr}"
-        )
+        raise RuntimeError("convert_hf_to_gguf failed:\n" f"{proc.stdout}\n{proc.stderr}")
 
 
 def auto_convert_safetensors_to_gguf(
@@ -147,9 +144,7 @@ def auto_convert_safetensors_to_gguf(
         text=True,
     )
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"llama-quantize failed:\n{proc.stdout}\n{proc.stderr}"
-        )
+        raise RuntimeError(f"llama-quantize failed:\n{proc.stdout}\n{proc.stderr}")
 
     with contextlib.suppress(OSError):
         f16_path.unlink()

@@ -17,6 +17,45 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_ID = "MiniMaxAI/MiniMax-M2.7"
 VALID_PRESETS = ("speed", "balanced", "memory", "quality", "moe")
+VALID_QUANTIZATIONS = frozenset(
+    {
+        "Q2_K",
+        "Q3_K",
+        "Q3_K_S",
+        "Q3_K_M",
+        "Q4_K_M",
+        "Q5_K_M",
+        "Q6_K",
+        "Q8_0",
+        "F16",
+        "UD-TQ1_0",
+        "UD-IQ1_S",
+        "UD-IQ1_M",
+        "UD-IQ2_XXS",
+        "UD-IQ2_M",
+        "UD-Q2_K_XL",
+        "UD-IQ3_XXS",
+        "UD-IQ3_S",
+        "UD-IQ3_K_S",
+        "UD-Q3_K_M",
+        "UD-Q3_K_XL",
+        "UD-IQ4_XS",
+        "UD-Q4_K_S",
+        "MXFP4_MOE",
+        "UD-Q4_NL",
+        "UD-Q4_K_M",
+        "UD-Q4_K_XL",
+        "UD-Q5_K_S",
+        "UD-Q5_K_M",
+        "UD-Q5_K_XL",
+        "UD-Q6_K",
+        "UD-Q6_K_XL",
+        "UD-Q8_K_XL",
+        "BF16",
+    }
+)
+VALID_MEMORY_MODES = frozenset({"auto", "resident", "mmap", "paged_moe"})
+VALID_BACKENDS = frozenset({"llama_cpp", "transformers"})
 
 
 def _read_bool_env(name: str) -> bool | None:
@@ -90,6 +129,7 @@ class M7Config:
 
     # CPU settings
     n_threads: int = 8
+    n_threads_batch: int | None = None
     n_batch: int = 2048
     n_ubatch: int = 512
     cpu_mask: str = "0-7"
@@ -146,6 +186,16 @@ class M7Config:
     default_temperature: float = 1.0
     default_top_p: float = 0.95
     default_top_k: int = 40
+    min_p: float = 0.0
+    typical_p: float = 1.0
+    repeat_penalty: float = 1.1
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    mirostat_mode: int = 0
+    mirostat_tau: float = 5.0
+    mirostat_eta: float = 0.1
+    tfs_z: float = 1.0
+    seed: int = -1
 
     # Feature flags
     enable_tools: bool = True
@@ -172,52 +222,15 @@ class M7Config:
         if self.n_ctx < 512:
             logger.warning("Context window %s very small, minimum 512 recommended", self.n_ctx)
 
-        valid_quants = [
-            "Q2_K",
-            "Q3_K",
-            "Q3_K_S",
-            "Q3_K_M",
-            "Q4_K_M",
-            "Q5_K_M",
-            "Q6_K",
-            "Q8_0",
-            "F16",
-            "UD-TQ1_0",
-            "UD-IQ1_S",
-            "UD-IQ1_M",
-            "UD-IQ2_XXS",
-            "UD-IQ2_M",
-            "UD-Q2_K_XL",
-            "UD-IQ3_XXS",
-            "UD-IQ3_S",
-            "UD-IQ3_K_S",
-            "UD-Q3_K_M",
-            "UD-Q3_K_XL",
-            "UD-IQ4_XS",
-            "UD-Q4_K_S",
-            "MXFP4_MOE",
-            "UD-Q4_NL",
-            "UD-Q4_K_M",
-            "UD-Q4_K_XL",
-            "UD-Q5_K_S",
-            "UD-Q5_K_M",
-            "UD-Q5_K_XL",
-            "UD-Q6_K",
-            "UD-Q6_K_XL",
-            "UD-Q8_K_XL",
-            "BF16",
-        ]
-        if self.quantization not in valid_quants:
+        if self.quantization not in VALID_QUANTIZATIONS:
             logger.warning("Unknown quantization %s, using Q4_K_M", self.quantization)
             self.quantization = "Q4_K_M"
 
-        valid_memory_modes = ["auto", "resident", "mmap", "paged_moe"]
-        if self.memory_mode not in valid_memory_modes:
+        if self.memory_mode not in VALID_MEMORY_MODES:
             logger.warning("Unknown memory_mode %s, using auto", self.memory_mode)
             self.memory_mode = "auto"
 
-        valid_backends = ["llama_cpp", "transformers"]
-        if self.backend not in valid_backends:
+        if self.backend not in VALID_BACKENDS:
             logger.warning("Unknown backend %s, using llama_cpp", self.backend)
             self.backend = "llama_cpp"
 
@@ -247,10 +260,14 @@ class M7Config:
             config.n_threads = 16
             config.n_batch = 4096
             config.n_ubatch = 1024
-            config.cache_type_k = "f16"
-            config.cache_type_v = "f16"
+            config.cache_type_k = "q8_0"
+            config.cache_type_v = "q8_0"
             config.flash_attn = True
             config.priority = "high"
+            config.default_temperature = 0.0
+            config.default_top_p = 1.0
+            config.default_top_k = 1
+            config.repeat_penalty = 1.05
         elif preset == "balanced":
             config.n_threads = 12
             config.n_batch = 2048
@@ -339,6 +356,18 @@ class M7Config:
             max_tokens=_read_int_env("MINIFORGE_MAX_TOKENS"),
             temperature=_read_float_env("MINIFORGE_TEMPERATURE"),
             top_p=_read_float_env("MINIFORGE_TOP_P"),
+            top_k=_read_int_env("MINIFORGE_TOP_K"),
+            min_p=_read_float_env("MINIFORGE_MIN_P"),
+            typical_p=_read_float_env("MINIFORGE_TYPICAL_P"),
+            repeat_penalty=_read_float_env("MINIFORGE_REPEAT_PENALTY"),
+            presence_penalty=_read_float_env("MINIFORGE_PRESENCE_PENALTY"),
+            frequency_penalty=_read_float_env("MINIFORGE_FREQUENCY_PENALTY"),
+            mirostat_mode=_read_int_env("MINIFORGE_MIROSTAT_MODE"),
+            mirostat_tau=_read_float_env("MINIFORGE_MIROSTAT_TAU"),
+            mirostat_eta=_read_float_env("MINIFORGE_MIROSTAT_ETA"),
+            tfs_z=_read_float_env("MINIFORGE_TFS_Z"),
+            seed=_read_int_env("MINIFORGE_SEED"),
+            n_threads_batch=_read_int_env("MINIFORGE_N_THREADS_BATCH"),
             verbose=_read_bool_env("MINIFORGE_VERBOSE"),
         )
         if os.environ.get("MINIFORGE_QUANTIZATION") is None:
@@ -409,60 +438,66 @@ class M7Config:
         max_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        typical_p: float | None = None,
+        repeat_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        mirostat_mode: int | None = None,
+        mirostat_tau: float | None = None,
+        mirostat_eta: float | None = None,
+        tfs_z: float | None = None,
+        seed: int | None = None,
+        n_threads_batch: int | None = None,
         verbose: bool | None = None,
     ) -> M7Config:
         """Apply non-None overrides in place and return the config."""
-        if model_id is not None:
-            self.model_id = model_id
-        if backend is not None:
-            self.backend = backend
-        if quantization is not None:
-            self.quantization = quantization
-        if download_dir is not None:
-            self.download_dir = download_dir
-        if cache_dir is not None:
-            self.cache_dir = cache_dir
-        if model_weights_path is not None:
-            self.model_weights_path = model_weights_path
-        if model_dirs is not None:
-            self.model_dirs = model_dirs
-        if llama_cpp_path is not None:
-            self.llama_cpp_path = llama_cpp_path
-        if offline is not None:
-            self.offline = offline
-        if log_level is not None:
-            self.log_level = log_level
+        attr_overrides: dict[str, Any] = {
+            "model_id": model_id,
+            "backend": backend,
+            "quantization": quantization,
+            "download_dir": download_dir,
+            "cache_dir": cache_dir,
+            "model_weights_path": model_weights_path,
+            "model_dirs": model_dirs,
+            "llama_cpp_path": llama_cpp_path,
+            "offline": offline,
+            "log_level": log_level,
+            "n_threads": n_threads,
+            "n_batch": n_batch,
+            "n_ubatch": n_ubatch,
+            "n_gpu_layers": n_gpu_layers,
+            "cache_type_k": cache_type_k,
+            "cache_type_v": cache_type_v,
+            "use_mmap": use_mmap,
+            "use_mlock": use_mlock,
+            "auto_context": auto_context,
+            "memory_mode": memory_mode,
+            "default_max_tokens": max_tokens,
+            "default_temperature": temperature,
+            "default_top_p": top_p,
+            "default_top_k": top_k,
+            "min_p": min_p,
+            "typical_p": typical_p,
+            "repeat_penalty": repeat_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+            "mirostat_mode": mirostat_mode,
+            "mirostat_tau": mirostat_tau,
+            "mirostat_eta": mirostat_eta,
+            "tfs_z": tfs_z,
+            "seed": seed,
+            "n_threads_batch": n_threads_batch,
+            "verbose": verbose,
+        }
+        for attr_name, value in attr_overrides.items():
+            if value is not None:
+                setattr(self, attr_name, value)
+
         if n_ctx is not None:
             self.n_ctx = n_ctx
             self.auto_context = False
-        if n_threads is not None:
-            self.n_threads = n_threads
-        if n_batch is not None:
-            self.n_batch = n_batch
-        if n_ubatch is not None:
-            self.n_ubatch = n_ubatch
-        if n_gpu_layers is not None:
-            self.n_gpu_layers = n_gpu_layers
-        if cache_type_k is not None:
-            self.cache_type_k = cache_type_k
-        if cache_type_v is not None:
-            self.cache_type_v = cache_type_v
-        if use_mmap is not None:
-            self.use_mmap = use_mmap
-        if use_mlock is not None:
-            self.use_mlock = use_mlock
-        if auto_context is not None:
-            self.auto_context = auto_context
-        if memory_mode is not None:
-            self.memory_mode = memory_mode
-        if max_tokens is not None:
-            self.default_max_tokens = max_tokens
-        if temperature is not None:
-            self.default_temperature = temperature
-        if top_p is not None:
-            self.default_top_p = top_p
-        if verbose is not None:
-            self.verbose = verbose
 
         self.__post_init__()
         return self
@@ -509,6 +544,20 @@ class M7Config:
             "cpu_mask": self.cpu_mask,
             "cpu_strict": self.cpu_strict,
             "priority": self.priority,
+            "n_threads_batch": self.n_threads_batch,
+            "min_p": self.min_p,
+            "typical_p": self.typical_p,
+            "repeat_penalty": self.repeat_penalty,
+            "presence_penalty": self.presence_penalty,
+            "frequency_penalty": self.frequency_penalty,
+            "mirostat_mode": self.mirostat_mode,
+            "mirostat_tau": self.mirostat_tau,
+            "mirostat_eta": self.mirostat_eta,
+            "tfs_z": self.tfs_z,
+            "seed": self.seed,
+            "speculative_n_max": self.speculative_n_max,
+            "speculative_n_min": self.speculative_n_min,
+            "speculative_p_min": self.speculative_p_min,
         }
         if self.use_avx is not None:
             config["use_avx"] = self.use_avx
@@ -541,6 +590,11 @@ class M7Config:
             "temperature": self.default_temperature,
             "top_p": self.default_top_p,
             "top_k": self.default_top_k,
+            "min_p": self.min_p,
+            "typical_p": self.typical_p,
+            "repeat_penalty": self.repeat_penalty,
+            "presence_penalty": self.presence_penalty,
+            "frequency_penalty": self.frequency_penalty,
         }
 
     def resolved_model_weights_dir(self) -> Path | None:

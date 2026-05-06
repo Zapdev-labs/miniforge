@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 SMALL_DENSE_MAX_B = 12.0
 MEDIUM_DENSE_MAX_B = 34.0
 LARGE_DENSE_MAX_B = 80.0
+PF_AVX_INSTRUCTIONS_AVAILABLE = 39
+PF_AVX2_INSTRUCTIONS_AVAILABLE = 40
+PF_AVX512F_INSTRUCTIONS_AVAILABLE = 41
 
 QUANT_BITS_PER_WEIGHT = {
     "UD-TQ1_0": 1.0,
@@ -266,12 +269,7 @@ def _read_cpu_flags_windows() -> list[str]:
     """Detect CPU feature flags on Windows via CPUID-like heuristics."""
     flags: list[str] = []
     try:
-        # IsProcessorFeaturePresent constants
-        PF_AVX_INSTRUCTIONS_AVAILABLE = 39  # noqa: N806
-        PF_AVX2_INSTRUCTIONS_AVAILABLE = 40  # noqa: N806
-        PF_AVX512F_INSTRUCTIONS_AVAILABLE = 41  # noqa: N806
-
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         if kernel32.IsProcessorFeaturePresent(PF_AVX_INSTRUCTIONS_AVAILABLE):
             flags.append("avx")
         if kernel32.IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE):
@@ -313,20 +311,14 @@ def _read_cpu_flags_darwin() -> list[str]:
 def detect_cpu() -> CpuInfo:
     """Detect CPU information."""
     info = CpuInfo()
-
-    # Core counts
     info.physical_cores = psutil.cpu_count(logical=False) or 4
     info.logical_cores = psutil.cpu_count(logical=True) or 8
-
-    # Frequency
     try:
         freq = psutil.cpu_freq()
         if freq:
             info.max_freq_mhz = freq.max or freq.current or 0.0
     except Exception:
         pass
-
-    # OS-specific flag detection
     if sys.platform.startswith("linux"):
         info.flags = _read_cpu_flags_linux()
         try:
@@ -358,7 +350,6 @@ def detect_cpu() -> CpuInfo:
         except Exception:
             pass
 
-    # Normalize flags
     info.flags = [f.lower() for f in info.flags]
     logger.info(
         "CPU detected: %s, %d cores (%d threads), flags=%s",
@@ -410,7 +401,6 @@ def _detect_nvidia_gpus() -> list[GpuInfo]:
 def _detect_amd_gpus_linux() -> list[GpuInfo]:
     """Detect AMD GPUs on Linux via rocminfo or lspci."""
     gpus: list[GpuInfo] = []
-    # Try rocminfo first
     try:
         result = subprocess.run(
             ["rocminfo"],
@@ -419,14 +409,12 @@ def _detect_amd_gpus_linux() -> list[GpuInfo]:
             timeout=10,
         )
         if result.returncode == 0:
-            # Very basic parsing
             names = re.findall(r"Name:\s+(.*AMD.*|.*Radeon.*)", result.stdout)
             for name in names:
                 gpus.append(GpuInfo(name=name.strip(), vendor="AMD", vram_gb=0.0))
     except Exception:
         pass
 
-    # Fallback to lspci
     if not gpus:
         try:
             result = subprocess.run(
@@ -485,7 +473,6 @@ def detect_gpus() -> list[GpuInfo]:
         gpus.extend(_detect_nvidia_gpus())
         gpus.extend(_detect_amd_gpus_linux())
 
-    # Deduplicate by name
     seen: set = set()
     unique: list[GpuInfo] = []
     for gpu in gpus:
@@ -563,17 +550,10 @@ def detect_hardware() -> HardwareProfile:
 
 def _infer_quantization(ram_gb: float, model_params_b: float, is_moe: bool = False) -> str:
     """Infer best quantization given RAM and model size."""
-    # Rough FP16 size in GB
     fp16_gb = model_params_b * 2.0
     if is_moe:
-        # MoE models use mmap heavily; we can tolerate larger disk size
-        # but active params matter. Rough heuristic: treat as ~30% of fp16_gb
         fp16_gb = model_params_b * 0.6
-
-    # Reserve OS + working memory
     usable = max(ram_gb * 0.75, 4.0)
-
-    # Quant ratios vs FP16
     candidates = [
         ("Q8_0", 1.0),
         ("Q6_K", 0.75),
@@ -585,7 +565,6 @@ def _infer_quantization(ram_gb: float, model_params_b: float, is_moe: bool = Fal
 
     for quant, ratio in candidates:
         model_gb = fp16_gb * ratio
-        # Rough KV overhead for 32k context
         kv_gb = 1.5
         if model_gb + kv_gb <= usable:
             return quant
@@ -611,16 +590,25 @@ def recommend_optimizations(
     reasons: list[str] = []
     warnings: list[str] = []
 
-    # Threads: dense decode often gets slower when SMT oversubscribes memory bandwidth.
     physical_cores = max(1, profile.cpu.physical_cores)
-    if model_class in {"small_dense", "medium_dense"}:
-        config["n_threads"] = physical_cores
+    logical_cores = max(1, profile.cpu.logical_cores)
+    if model_class == "small_dense":
+        config["n_threads"] = min(logical_cores, max(physical_cores, int(physical_cores * 1.5)))
+        config["n_threads_batch"] = logical_cores
         reasons.append(
-            f"Using {physical_cores} physical inference threads for {model_class}; "
-            "dense decode is usually memory-bandwidth bound."
+            f"Using {config['n_threads']} decode threads with {logical_cores} batch threads "
+            "for small dense throughput."
+        )
+    elif model_class == "medium_dense":
+        config["n_threads"] = min(logical_cores, max(physical_cores, physical_cores + 2))
+        config["n_threads_batch"] = logical_cores
+        reasons.append(
+            f"Using {config['n_threads']} decode threads with {logical_cores} batch threads "
+            "for medium dense throughput."
         )
     else:
         config["n_threads"] = physical_cores
+        config["n_threads_batch"] = logical_cores
         if profile.cpu.logical_cores > profile.cpu.physical_cores:
             config["n_threads"] = max(1, physical_cores + physical_cores // 2)
         reasons.append(
@@ -628,10 +616,8 @@ def recommend_optimizations(
             f"{profile.cpu.physical_cores} physical cores / "
             f"{max(1, profile.cpu.logical_cores)} logical threads."
         )
-    logical_cores = max(1, profile.cpu.logical_cores)
     config["cpu_mask"] = f"0-{logical_cores - 1}" if logical_cores > 1 else "0"
 
-    # RAM-based safety
     total_ram = profile.total_ram_gb
     config["max_memory_gb"] = max(4.0, total_ram - 4.0)
     config["reserve_memory_gb"] = min(4.0, total_ram * 0.15)
@@ -647,7 +633,6 @@ def recommend_optimizations(
             "Available RAM is moderately low; close memory-heavy apps for longer context."
         )
 
-    # Batch sizes scale with model class and available RAM.
     n_batch, n_ubatch = _batch_sizes_for_tier(model_class, total_ram)
     config["n_batch"] = n_batch
     config["n_ubatch"] = n_ubatch
@@ -655,7 +640,6 @@ def recommend_optimizations(
         config["n_batch"] = min(config["n_batch"], 512)
         config["n_ubatch"] = min(config["n_ubatch"], 256)
 
-    # Context window: small dense models should not pay MiniMax-scale KV costs.
     if model_class == "moe":
         if total_ram >= 64:
             config["n_ctx"] = 98_304
@@ -670,18 +654,20 @@ def recommend_optimizations(
     elif profile.memory_pressure == "medium":
         config["n_ctx"] = min(config["n_ctx"], 65_536)
 
-    # Quantization
     config["quantization"] = _infer_quantization(total_ram, model_params_b, is_moe)
     reasons.append(
         f"Selected {config['quantization']} quantization for ~{model_params_b:.1f}B params "
         f"on {total_ram:.1f}GB RAM."
     )
 
-    # KV cache: avoid ultra-compressed KV for small dense models when RAM is available.
     if model_class == "small_dense" and total_ram >= 64:
         config["cache_type_k"] = "f16"
         config["cache_type_v"] = "f16"
         reasons.append("Using f16 KV cache for small dense model throughput on high-RAM hardware.")
+    elif model_class == "small_dense" and total_ram >= 24:
+        config["cache_type_k"] = "f16"
+        config["cache_type_v"] = "f16"
+        reasons.append("Using f16 KV cache for small dense throughput on 24GB+ RAM hardware.")
     elif model_class == "small_dense" and total_ram >= 16:
         config["cache_type_k"] = "q8_0"
         config["cache_type_v"] = "q8_0"
@@ -697,7 +683,6 @@ def recommend_optimizations(
         config["cache_type_v"] = "q4_0"
         reasons.append("Using q4_0 KV cache for broad llama.cpp compatibility and lower RAM use.")
 
-    # CPU ISA
     config["use_avx"] = profile.cpu.has_avx
     config["use_avx2"] = profile.cpu.has_avx2
     config["use_avx512"] = profile.cpu.has_avx512
@@ -708,11 +693,9 @@ def recommend_optimizations(
     elif not profile.cpu.has_avx:
         warnings.append("AVX was not detected; CPU inference may be significantly slower.")
 
-    # OS-specific baseline. Residency decisions below may disable mmap for small dense models.
     config["use_mlock"] = False
     config["use_mmap"] = True
     if profile.is_wsl:
-        # WSL2 memory reclaim can be aggressive; be conservative
         config["max_memory_gb"] = max(4.0, total_ram * 0.65)
         warnings.append("WSL detected; memory target reduced and mlock disabled for safer paging.")
 
@@ -743,7 +726,6 @@ def recommend_optimizations(
                 f"Estimated {estimated_gb:.1f}GB weights exceed resident budget; using mmap."
             )
 
-    # GPU offloading
     config["n_gpu_layers"] = 0
     if profile.gpus:
         for gpu in profile.gpus:
@@ -768,12 +750,10 @@ def recommend_optimizations(
     else:
         reasons.append("No usable GPU detected; optimized for CPU inference with mmap.")
 
-    # Priority
     config["priority"] = "normal"
     if not profile.is_windows and profile.memory_pressure != "high":
         config["priority"] = "high"
 
-    # MoE
     config["is_moe"] = is_moe
     if is_moe:
         config["use_mmap"] = True

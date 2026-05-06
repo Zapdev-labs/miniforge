@@ -281,8 +281,15 @@ class MemoryManager:
 
         # Snap to standard sizes
         standard_sizes = [
-            1024, 2048, 4096, 8192, 16384, 32768,
-            65536, 131072, 194_560,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384,
+            32768,
+            65536,
+            131072,
+            194_560,
         ]
         best_ctx = 2048  # minimum useful size
         for size in standard_sizes:
