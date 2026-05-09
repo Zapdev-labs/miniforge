@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import ipaddress
 import logging
 import socket
 from dataclasses import dataclass
-from typing import List, Optional, Set, Callable
+from typing import Awaitable, Callable, List, Optional, Set
 import time
 
 logger = logging.getLogger(__name__)
@@ -66,14 +67,14 @@ class MeshDiscovery:
         self.cpu_cores = cpu_cores
         
         self._peers: dict[str, PeerInfo] = {}
-        self._callbacks: List[Callable[[PeerInfo, str], None]] = []
+        self._callbacks: List[Callable[[PeerInfo, str], None | Awaitable[None]]] = []
         self._running = False
         self._zeroconf: Optional[AsyncZeroconf] = None
         self._browser: Optional[ServiceBrowser] = None
         self._scan_task: Optional[asyncio.Task] = None
         self._broadcast_task: Optional[asyncio.Task] = None
         
-    def on_peer_discovered(self, callback: Callable[[PeerInfo, str], None]) -> None:
+    def on_peer_discovered(self, callback: Callable[[PeerInfo, str], None | Awaitable[None]]) -> None:
         """Register callback for peer events. Events: 'added', 'updated', 'removed'."""
         self._callbacks.append(callback)
         
@@ -81,7 +82,9 @@ class MeshDiscovery:
         """Notify all callbacks of peer event."""
         for cb in self._callbacks:
             try:
-                cb(peer, event)
+                result = cb(peer, event)
+                if inspect.isawaitable(result):
+                    asyncio.create_task(result)
             except Exception as e:
                 logger.warning(f"Discovery callback error: {e}")
                 

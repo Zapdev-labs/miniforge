@@ -1,7 +1,8 @@
 """Test core functionality."""
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 from miniforge.core.memory import MemoryManager, MemoryStats
 from miniforge.utils.config import M7Config
@@ -11,9 +12,9 @@ def test_memory_manager_initialization():
     """Test memory manager initialization."""
     mem = MemoryManager()
 
-    # Should have correct limits for M7
-    assert mem.TOTAL_RAM_GB == 28.0
-    assert mem.MAX_AVAILABLE_GB == 24.0
+    # Should expose dynamic machine-aware limits.
+    assert mem.total_ram_gb > 0
+    assert mem.max_available_gb > 0
     assert mem.max_usable_gb > 0
 
 
@@ -27,7 +28,7 @@ def test_memory_manager_select_quantization():
 
     # 7B model might need more aggressive quantization
     quant_7b = mem.select_quantization(7.0)
-    assert quant_7b in ["Q3_K_M", "Q4_K_M"]
+    assert quant_7b in ["Q2_K", "Q3_K_M", "Q4_K_M"]
 
 
 def test_memory_manager_calculate_max_context():
@@ -58,9 +59,9 @@ def test_m7_config_defaults():
     config = M7Config()
 
     assert config.n_threads == 8
-    assert config.n_ctx == 200_000
-    assert config.quantization == "Q4_K_M"
-    assert config.cache_type_k == "turbo3"
+    assert config.n_ctx == 194_560
+    assert config.quantization == "UD-IQ2_XXS"
+    assert config.cache_type_k == "q4_0"
     assert config.max_memory_gb == 24.0
 
 
@@ -93,6 +94,8 @@ def test_backend_config():
     assert "n_ctx" in backend_config
     assert "cache_type_k" in backend_config
     assert "flash_attn" in backend_config
+    assert backend_config["auto_context"] is True
+    assert backend_config["memory_mode"] == "auto"
 
 
 def test_generation_defaults():
@@ -107,12 +110,203 @@ def test_generation_defaults():
     assert defaults["temperature"] == 0.7
 
 
+def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Environment overrides should layer onto the resolved config."""
+    monkeypatch.setenv("MINIFORGE_PRESET", "memory")
+    monkeypatch.setenv("MINIFORGE_MODEL", "acme/test-model")
+    monkeypatch.setenv("MINIFORGE_BACKEND", "transformers")
+    monkeypatch.setenv("MINIFORGE_MAX_TOKENS", "1024")
+    monkeypatch.setenv("MINIFORGE_TEMPERATURE", "0.4")
+    monkeypatch.setenv("MINIFORGE_MODEL_DIRS", "/models/a;/models/b")
+    monkeypatch.setenv("MINIFORGE_OFFLINE", "1")
+    monkeypatch.setenv("MINIFORGE_N_CTX", "8192")
+
+    config = M7Config.from_env()
+
+    assert config.model_id == "acme/test-model"
+    assert config.backend == "transformers"
+    assert config.default_max_tokens == 1024
+    assert config.default_temperature == 0.4
+    assert config.quantization == "UD-IQ2_XXS"
+    assert config.model_dirs == ["/models/a", "/models/b"]
+    assert config.offline is True
+    assert config.n_ctx == 8192
+    assert config.auto_context is False
+
+
+def test_config_summary() -> None:
+    """Runtime summary should expose the user-visible config surface."""
+    config = M7Config(model_id="demo/model", backend="transformers")
+
+    summary = config.summary()
+
+    assert summary["model_id"] == "demo/model"
+    assert summary["backend"] == "transformers"
+    assert summary["generation"]["max_tokens"] == config.default_max_tokens
+    assert summary["offline"] is False
+
+
+def test_config_from_env_applies_known_model_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Known large models should use registry-safe defaults unless explicitly overridden."""
+    monkeypatch.delenv("MINIFORGE_QUANTIZATION", raising=False)
+    monkeypatch.setenv("MINIFORGE_MODEL", "MiniMaxAI/MiniMax-M2.7")
+
+    config = M7Config.from_env()
+
+    assert config.quantization == "UD-IQ2_XXS"
+    assert config.is_moe is True
+    assert config.max_model_ctx == 196_608
+    assert config.model_params_b == 228.0
+
+
+def test_model_metadata_flows_to_backend_config() -> None:
+    """Known model size should reach backend tuning diagnostics."""
+    config = M7Config(model_id="Qwen/Qwen3-8B")
+
+    config.apply_model_metadata()
+    backend_config = config.get_backend_config()
+
+    assert config.model_params_b == 8.0
+    assert backend_config["model_params_b"] == 8.0
+    assert config.is_moe is False
+
+
+def test_speed_preset_uses_throughput_defaults() -> None:
+    """Speed preset should prioritize deterministic throughput settings."""
+    config = M7Config.performance_preset("speed")
+
+    assert config.cache_type_k == "q8_0"
+    assert config.cache_type_v == "q8_0"
+    assert config.default_temperature == 0.0
+    assert config.default_top_p == 1.0
+    assert config.default_top_k == 1
+    assert config.repeat_penalty == 1.05
+
+
+def test_config_from_env_includes_sampling_tuning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sampling knobs should be configurable via env and flow to backend config."""
+    monkeypatch.setenv("MINIFORGE_TOP_K", "24")
+    monkeypatch.setenv("MINIFORGE_MIN_P", "0.08")
+    monkeypatch.setenv("MINIFORGE_REPEAT_PENALTY", "1.02")
+    monkeypatch.setenv("MINIFORGE_SEED", "123")
+    monkeypatch.setenv("MINIFORGE_N_THREADS_BATCH", "14")
+
+    config = M7Config.from_env()
+    backend_config = config.get_backend_config()
+
+    assert config.default_top_k == 24
+    assert config.min_p == 0.08
+    assert config.repeat_penalty == 1.02
+    assert backend_config["seed"] == 123
+    assert backend_config["n_threads_batch"] == 14
+
+
+def test_llama_backend_auto_tunes_default_backend_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct GGUF configs should inherit hardware tuning for default backend values."""
+    from miniforge.core.backends.llama_cpp import _apply_hardware_auto_tuning
+
+    def fake_auto_config(model_params_b: float, is_moe: bool) -> dict[str, object]:
+        assert model_params_b == 4.0
+        assert is_moe is False
+        return {
+            "n_ctx": 32_768,
+            "n_threads": 12,
+            "n_batch": 4096,
+            "n_ubatch": 1024,
+            "cache_type_k": "q8_0",
+            "cache_type_v": "q8_0",
+            "use_mmap": False,
+            "memory_mode": "resident",
+        }
+
+    monkeypatch.setattr("miniforge.utils.hardware.auto_config", fake_auto_config)
+    config = M7Config(n_ctx=4096, quantization="Q4_K_M").get_backend_config()
+
+    _apply_hardware_auto_tuning(config, model_params_b=4.0, is_moe=False)
+
+    assert config["n_ctx"] == 4096
+    assert config["n_threads"] == 12
+    assert config["n_batch"] == 4096
+    assert config["cache_type_k"] == "q8_0"
+    assert config["use_mmap"] is False
+    assert config["memory_mode"] == "resident"
+    assert config["n_threads_batch"] is None
+
+
+def test_llama_backend_auto_tuning_preserves_explicit_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-default caller choices should not be overwritten by auto tuning."""
+    from miniforge.core.backends.llama_cpp import _apply_hardware_auto_tuning
+
+    monkeypatch.setattr(
+        "miniforge.utils.hardware.auto_config",
+        lambda model_params_b, is_moe: {"n_threads": 12, "cache_type_k": "q8_0"},
+    )
+    config = M7Config(n_threads=6, cache_type_k="f16").get_backend_config()
+
+    _apply_hardware_auto_tuning(config, model_params_b=4.0, is_moe=False)
+
+    assert config["n_threads"] == 6
+    assert config["cache_type_k"] == "f16"
+
+
+def test_filter_supported_kwargs_drops_unknown() -> None:
+    """Unknown kwargs should be filtered for callables without **kwargs."""
+    from miniforge.core.backends.llama_cpp import _filter_supported_kwargs
+
+    def sample_fn(alpha: int, beta: int) -> int:
+        return alpha + beta
+
+    filtered = _filter_supported_kwargs(sample_fn, {"alpha": 1, "beta": 2, "gamma": 3})
+    assert filtered == {"alpha": 1, "beta": 2}
+
+
+def test_llama_completion_kwargs_sync_stream_parity() -> None:
+    """Sync and stream should share identical decoding knobs except stream flag."""
+    from miniforge.core.backends.llama_cpp import LlamaCppBackend
+
+    backend = LlamaCppBackend(
+        model_path=Path("model.gguf"),
+        config={
+            "min_p": 0.05,
+            "repeat_penalty": 1.01,
+            "seed": 7,
+            "speculative_n_max": 10,
+        },
+    )
+    sync_kwargs = backend._build_completion_kwargs(
+        prompt="hi",
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=1,
+        stop=["x"],
+        stream=False,
+    )
+    stream_kwargs = backend._build_completion_kwargs(
+        prompt="hi",
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=1,
+        stop=["x"],
+        stream=True,
+    )
+
+    assert {k: v for k, v in sync_kwargs.items() if k != "stream"} == {
+        k: v for k, v in stream_kwargs.items() if k != "stream"
+    }
+    assert sync_kwargs["stream"] is False
+    assert stream_kwargs["stream"] is True
+
+
 @pytest.mark.asyncio
 async def test_engine_initialization_mock():
     """Mock test for engine initialization."""
     # This would require actual model files to test fully
     # For now, just test the config passes through
-    from miniforge.core.engine import InferenceEngine
-
     # Can't test without model, but can verify structure
     pass

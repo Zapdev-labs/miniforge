@@ -1,9 +1,10 @@
 """Tool calling support for MiniMax models."""
 
-from typing import List, Dict, Any, Callable, Optional
 from dataclasses import dataclass
+import asyncio
 import json
 import logging
+from typing import List, Dict, Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +119,6 @@ class ToolExecutor:
                 result = await handler(**tool_call.arguments)
             else:
                 # Run sync function in thread pool
-                import asyncio
-
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(None, lambda: handler(**tool_call.arguments))
 
@@ -260,6 +259,3 @@ def create_web_search_tool(search_func: Optional[Callable] = None) -> Tool:
         },
         handler=search_func,
     )
-
-
-import asyncio

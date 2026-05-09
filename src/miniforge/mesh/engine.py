@@ -77,7 +77,7 @@ class DistributedInferenceEngine:
         if strategy == "local":
             # Local execution
             if stream:
-                return self.local_engine.generate(
+                return await self.local_engine.generate(
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,

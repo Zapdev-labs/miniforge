@@ -127,6 +127,7 @@ class Miniforge:
     ) -> None:
         """Load and prepare model."""
         model_id = str(self.model_path)
+        local_model_path = Path(model_id).expanduser()
 
         # Resolve download directory: explicit arg > config field > registry gguf_dir default
         gguf_download_dir = (
@@ -136,8 +137,8 @@ class Miniforge:
         )
         gguf_download_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get model info
-        model_info = self._registry.get_model_info(model_id)
+        # Get model info. Local GGUF paths should never be treated as Hub repo IDs.
+        model_info = None if local_model_path.is_file() else self._registry.get_model_info(model_id)
 
         # Model architecture mapping: model_id -> n_layers
         MODEL_ARCHITECTURE = {
@@ -184,6 +185,7 @@ class Miniforge:
         if model_info:
             params = model_info.params_billions
             # Propagate per-model metadata to config
+            self.config.model_params_b = params
             if model_info.max_context:
                 self.config.max_model_ctx = model_info.max_context
             if model_info.is_moe:
@@ -251,11 +253,19 @@ class Miniforge:
                 quantization = self._memory_manager.select_quantization(params)
 
         # Check cache for GGUF
-        cached_path = self._registry.get_cached_gguf_path(model_id, quantization)
+        cached_path = None if local_model_path.is_file() else self._registry.get_cached_gguf_path(model_id, quantization)
 
-        if cached_path:
+        if local_model_path.is_file():
+            logger.info(f"Using local model path: {local_model_path}")
+            model_path = local_model_path
+        elif cached_path:
             logger.info(f"Using cached GGUF: {cached_path}")
             model_path = cached_path
+        elif self.config.offline:
+            raise FileNotFoundError(
+                f"Offline mode is enabled and no local model was found for {model_id!r} "
+                f"({quantization})."
+            )
         elif self.backend_name == "llama_cpp":
             # Try to download GGUF from HuggingFace
             try:

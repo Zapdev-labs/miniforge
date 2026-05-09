@@ -7,6 +7,7 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 from miniforge.mesh import (
     MeshDiscovery,

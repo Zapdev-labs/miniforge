@@ -11,6 +11,10 @@ High-performance Python library for MiniMax M2.7 inference, optimized for GMKtec
 - **Streaming**: Real-time token streaming for responsive UIs
 - **Memory Management**: Hard 28GB limits with automatic optimization
 - **Async Support**: Full asyncio support throughout
+- **Runtime Presets**: Speed, balanced, memory, quality, and MoE tuning profiles
+- **Config Doctoring**: Inspect detected hardware and resolved runtime config from the CLI
+- **Optimization Reports**: Explain why threads, context, KV cache, mmap, and offload were selected
+- **Local Model Hosting**: Register GGUF or HF-style directories and run fully offline
 
 ## Quick Start
 
@@ -19,7 +23,7 @@ High-performance Python library for MiniMax M2.7 inference, optimized for GMKtec
 uv pip install -e .
 
 # Or install from source
-git clone <repo>
+git clone https://github.com/Zapdev-labs/miniforge.git
 cd miniforge
 uv pip install -e ".[all]"
 ```
@@ -66,6 +70,26 @@ asyncio.run(main())
 
 ## Configuration
 
+Miniforge resolves configuration from three layers:
+
+1. Hardware auto-detection
+2. Optional performance preset
+3. Environment variables or CLI overrides
+
+Useful environment variables:
+
+```bash
+MINIFORGE_MODEL=MiniMaxAI/MiniMax-M2.7
+MINIFORGE_BACKEND=llama_cpp
+MINIFORGE_QUANTIZATION=Q4_K_M
+MINIFORGE_PRESET=balanced
+MINIFORGE_OFFLINE=1
+MINIFORGE_MODEL_DIRS=/models;/mnt/d/AI
+MINIFORGE_MODEL_WEIGHTS_PATH=/models/minimax/MiniMax-M2.7-Q4_K_M.gguf
+MINIFORGE_MAX_TOKENS=1024
+MINIFORGE_TEMPERATURE=0.7
+```
+
 Create `~/.config/miniforge/config.yaml`:
 
 ```yaml
@@ -86,6 +110,27 @@ from miniforge.utils.config import M7Config
 config = M7Config.from_yaml("configs/m7-optimized.yaml")
 model = await Miniforge.from_pretrained(config=config)
 ```
+
+### CLI Runtime Inspection
+
+```bash
+miniforge doctor
+miniforge doctor --preset memory --json
+miniforge register local/minimax /models/MiniMax-M2.7-Q4_K_M.gguf --quantization Q4_K_M
+miniforge serve --model local/minimax --offline
+miniforge chat --preset balanced --system-prompt "You are a concise coding assistant."
+```
+
+### Local Model Hosting
+
+Miniforge can now resolve models without contacting Hugging Face:
+
+```bash
+miniforge register local/m2 /models/MiniMax-M2.7-Q4_K_M.gguf --quantization Q4_K_M
+miniforge chat --model local/m2 --offline
+```
+
+Resolution order is: explicit `model_weights_path`, direct filesystem paths, registered hosted models, `MINIFORGE_MODEL_DIRS`, GGUF cache, then network download only when offline mode is disabled.
 
 ## Examples
 

@@ -30,9 +30,10 @@ class M7Config:
 
     # CPU settings
     n_threads: int = 8  # Physical cores - Ryzen 7 PRO 6850H
-    n_batch: int = 2048  # Increased for better throughput with 192K context
-    n_ubatch: int = 512  # Micro-batch size for processing
-    cpu_mask: str = "0-7"  # CPU affinity mask (e.g., "0-7" for cores 0-7)
+    n_threads_batch: Optional[int] = 16
+    n_batch: int = 256
+    n_ubatch: int = 128
+    cpu_mask: str = "0-15"  # CPU affinity mask (e.g., "0-15" for all logical CPUs)
     cpu_strict: bool = False  # Strict CPU pinning (may improve cache locality)
     priority: str = "normal"  # Thread priority: "normal", "realtime", "high"
 
@@ -46,6 +47,7 @@ class M7Config:
     # Model settings
     model_id: str = DEFAULT_MODEL_ID
     model_weights_path: Optional[str] = None
+    model_params_b: Optional[float] = None
     n_ctx: int = 194_560  # Full 192K context minus safety headroom (196608 - 2048)
     quantization: str = "UD-IQ2_XXS"  # Default for MiniMax M2.7 228B MoE on 28GB
 
@@ -63,6 +65,9 @@ class M7Config:
     speculative_n_max: int = 16  # Max draft tokens to speculatively decode
     speculative_n_min: int = 5   # Min draft tokens for speculative mode
     speculative_p_min: float = 0.8  # Min acceptance probability to continue drafting
+    prompt_lookup: bool = False
+    prompt_lookup_ngram: int = 4
+    prompt_lookup_tokens: int = 12
 
     # GPU offloading (for AMD Radeon 680M iGPU)
     n_gpu_layers: int = 0  # Set to 15-20 to offload some layers to 4GB VRAM
@@ -73,9 +78,13 @@ class M7Config:
     flash_attn: bool = True
     use_mmap: bool = True
     use_mlock: bool = False  # WSL2 doesn't support mlock
+    memory_mode: str = "auto"
     rope_scaling_type: Optional[str] = "linear"  # For long context scaling
-    rope_freq_base: float = 10000.0  # Default RoPE base frequency
-    rope_freq_scale: float = 1.0  # RoPE scaling factor (1.0 = no scaling)
+    rope_freq_base: float = 0.0  # 0 lets llama.cpp use the GGUF metadata
+    rope_freq_scale: float = 0.0  # 0 lets llama.cpp use the GGUF metadata
+    numa: bool = False
+    offload_kqv: bool = True
+    op_offload: Optional[bool] = None
 
     # Backend selection
     backend: str = "llama_cpp"  # llama_cpp or transformers
@@ -95,6 +104,7 @@ class M7Config:
     cache_dir: Optional[str] = None
     download_dir: Optional[str] = None  # Override where GGUF shards are downloaded (e.g. "D:/AI")
     llama_cpp_path: Optional[str] = None
+    offline: bool = False
 
     # Per-model overrides (set automatically from registry, or manually)
     max_model_ctx: Optional[int] = None  # Model's trained context ceiling (e.g. 262144 for Kimi K2.5)
@@ -129,6 +139,11 @@ class M7Config:
             logger.warning(f"Unknown backend {self.backend}, using llama_cpp")
             self.backend = "llama_cpp"
 
+        valid_memory_modes = ["auto", "mmap"]
+        if self.memory_mode not in valid_memory_modes:
+            logger.warning(f"Unknown memory_mode {self.memory_mode}, using auto")
+            self.memory_mode = "auto"
+
     @classmethod
     def performance_preset(cls, preset: str = "balanced") -> "M7Config":
         """Create a config optimized for a specific performance profile.
@@ -143,19 +158,21 @@ class M7Config:
         config = cls()
 
         if preset == "speed":
-            config.n_threads = 16
-            config.n_batch = 4096
-            config.n_ubatch = 1024
-            config.cache_type_k = "f16"
-            config.cache_type_v = "f16"
+            config.n_threads = 8
+            config.n_threads_batch = 16
+            config.n_batch = 512
+            config.n_ubatch = 256
+            config.cache_type_k = "q4_0"
+            config.cache_type_v = "q4_0"
             config.flash_attn = True
             config.priority = "high"
         elif preset == "balanced":
-            config.n_threads = 12
-            config.n_batch = 2048
-            config.n_ubatch = 512
-            config.cache_type_k = "q8_0"
-            config.cache_type_v = "q8_0"
+            config.n_threads = 8
+            config.n_threads_batch = 16
+            config.n_batch = 256
+            config.n_ubatch = 128
+            config.cache_type_k = "q4_0"
+            config.cache_type_v = "q4_0"
             config.flash_attn = True
         elif preset == "memory":
             config.n_threads = 8
@@ -173,9 +190,10 @@ class M7Config:
             config.flash_attn = False  # May affect precision slightly
             config.quantization = "Q8_0"
         elif preset == "moe":
-            config.n_threads = 16
-            config.n_batch = 2048
-            config.n_ubatch = 512
+            config.n_threads = 8
+            config.n_threads_batch = 16
+            config.n_batch = 256
+            config.n_ubatch = 128
             config.cache_type_k = "q4_0"
             config.cache_type_v = "q4_0"
             config.flash_attn = True
@@ -223,6 +241,7 @@ class M7Config:
         config = {
             "n_ctx": self.n_ctx,
             "n_threads": self.n_threads,
+            "n_threads_batch": self.n_threads_batch or self.n_threads,
             "n_batch": self.n_batch,
             "n_ubatch": self.n_ubatch,
             "cache_type_k": self.cache_type_k,
@@ -230,6 +249,7 @@ class M7Config:
             "flash_attn": self.flash_attn,
             "use_mmap": self.use_mmap,
             "use_mlock": self.use_mlock,
+            "memory_mode": self.memory_mode,
             "verbose": self.verbose,
             "n_gpu_layers": self.n_gpu_layers,
             "main_gpu": self.main_gpu,
@@ -237,6 +257,11 @@ class M7Config:
             "cpu_mask": self.cpu_mask,
             "cpu_strict": self.cpu_strict,
             "priority": self.priority,
+            "prompt_lookup": self.prompt_lookup,
+            "prompt_lookup_ngram": self.prompt_lookup_ngram,
+            "prompt_lookup_tokens": self.prompt_lookup_tokens,
+            "numa": self.numa,
+            "offload_kqv": self.offload_kqv,
         }
         # CPU ISA extensions (only if explicitly set)
         if self.use_avx is not None:
@@ -255,8 +280,12 @@ class M7Config:
             config["rope_scaling_type"] = self.rope_scaling_type
         config["rope_freq_base"] = self.rope_freq_base
         config["rope_freq_scale"] = self.rope_freq_scale
+        if self.op_offload is not None:
+            config["op_offload"] = self.op_offload
         if self.max_model_ctx is not None:
             config["max_model_ctx"] = self.max_model_ctx
+        if self.model_params_b is not None:
+            config["model_params_b"] = self.model_params_b
         if self.is_moe:
             config["is_moe"] = True
         return config

@@ -1,10 +1,12 @@
 """Llama.cpp backend for high-performance CPU inference."""
 
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
-from pathlib import Path
 import asyncio
+import contextlib
 import logging
+import re
 import time
+from pathlib import Path
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,28 @@ def _context_fallbacks(requested_n_ctx: int, max_safe_ctx: int) -> List[int]:
     return unique
 
 
+def _infer_model_params_from_path(model_path: Path) -> float | None:
+    haystack = " ".join([model_path.name, model_path.parent.name])
+    matches = re.findall(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[bB](?![A-Za-z])", haystack)
+    for raw in matches:
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if 0.1 <= value <= 2000.0:
+            return value
+    return None
+
+
+def _usage_int(usage: dict[str, Any], key: str, default: int) -> int:
+    value = usage.get(key, default)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return default
+
+
 class LlamaCppBackend:
     """
     Backend using llama-cpp-python for optimized CPU inference.
@@ -141,6 +165,8 @@ class LlamaCppBackend:
         self._llm = None
         self._lock = asyncio.Lock()
         self._last_tps: float = 0.0
+        self._last_generation: dict[str, Any] = {}
+        self._runtime_config: dict[str, Any] = {}
 
     async def initialize(self) -> None:
         """Initialize the Llama model with performance optimizations."""
@@ -153,6 +179,12 @@ class LlamaCppBackend:
 
         # Extract configuration with M7-optimized defaults for full 192K context
         requested_n_ctx = int(self.config.get("n_ctx", DEFAULT_OPTIMAL_CTX))
+        model_params_raw = self.config.get("model_params_b")
+        model_params_b = (
+            float(model_params_raw)
+            if isinstance(model_params_raw, (int, float))
+            else _infer_model_params_from_path(self.model_path)
+        )
         # Per-model context cap: MiniMax=196K, Kimi K2.5=262K, others use MiniMax default
         model_max_ctx = int(self.config.get("max_model_ctx", MAX_MINIMAX_TRAINED_CTX))
         max_safe_ctx = model_max_ctx - CTX_SAFETY_HEADROOM
@@ -167,6 +199,7 @@ class LlamaCppBackend:
 
         # CPU/GPU settings
         n_threads = self.config.get("n_threads", 8)
+        n_threads_batch = self.config.get("n_threads_batch", n_threads)
         n_batch = self.config.get("n_batch", 2048)  # Larger batch for 192K context
         n_ubatch = self.config.get("n_ubatch", 512)  # Micro-batch for chunked processing
         n_gpu_layers = self.config.get("n_gpu_layers", 0)
@@ -182,12 +215,16 @@ class LlamaCppBackend:
         # Memory mapping (optimize for large context)
         use_mmap = self.config.get("use_mmap", True)
         use_mlock = self.config.get("use_mlock", False)
+        memory_mode = str(self.config.get("memory_mode", "auto"))
 
         # MoE models: mmap is the mechanism that makes them runnable on limited RAM.
         # Force mmap=True and mlock=False — locking 240+ GB in RAM would crash the system.
         # AirLLM-inspired: also reduce batch sizes to minimize peak memory pressure,
         # letting the OS page-cache hold more active expert weights in RAM.
         is_moe = self.config.get("is_moe", False)
+        if memory_mode == "mmap":
+            use_mmap = True
+            use_mlock = False
         if is_moe:
             use_mmap = True
             use_mlock = False
@@ -202,12 +239,16 @@ class LlamaCppBackend:
                 )
 
         # RoPE settings for long context
-        rope_freq_base = self.config.get("rope_freq_base", 10000.0)
-        rope_freq_scale = self.config.get("rope_freq_scale", 1.0)
+        rope_freq_base = float(self.config.get("rope_freq_base", 0.0))
+        rope_freq_scale = float(self.config.get("rope_freq_scale", 0.0))
+        numa = bool(self.config.get("numa", False))
+        offload_kqv = bool(self.config.get("offload_kqv", True))
+        op_offload = self.config.get("op_offload")
 
         logger.info(f"Loading model from {self.model_path}")
         logger.info(f"Context: {n_ctx} tokens (model max: {model_max_ctx})")
-        logger.info(f"Threads: {n_threads}, Batch: {n_batch}/{n_ubatch}")
+        logger.info(f"Threads: {n_threads}, Batch threads: {n_threads_batch}, Batch: {n_batch}/{n_ubatch}")
+        logger.info(f"Memory mode: {memory_mode}, mmap={use_mmap}, mlock={use_mlock}")
         logger.info(f"KV cache: k={cache_type_k}, v={cache_type_v}, FlashAttn={flash_attn}")
         if is_moe:
             logger.info(
@@ -223,14 +264,19 @@ class LlamaCppBackend:
             "model_path": str(self.model_path),
             "n_ctx": n_ctx,
             "n_threads": n_threads,
+            "n_threads_batch": n_threads_batch,
             "n_batch": n_batch,
             "verbose": self.config.get("verbose", False),
             "use_mmap": use_mmap,
             "use_mlock": use_mlock,
             "rope_freq_base": rope_freq_base,
             "rope_freq_scale": rope_freq_scale,
+            "numa": numa,
+            "offload_kqv": offload_kqv,
             "chat_format": self.config.get("chat_format", None),
         }
+        if isinstance(op_offload, bool):
+            kwargs["op_offload"] = op_offload
 
         # Add micro-batch size if supported (helps with 192K context)
         if n_ubatch != n_batch:
@@ -264,6 +310,22 @@ class LlamaCppBackend:
             if "tensor_split" in self.config:
                 kwargs["tensor_split"] = self.config["tensor_split"]
 
+        if self.config.get("prompt_lookup", False):
+            try:
+                from llama_cpp.llama_speculative import LlamaPromptLookupDecoding
+
+                kwargs["draft_model"] = LlamaPromptLookupDecoding(
+                    max_ngram_size=int(self.config.get("prompt_lookup_ngram", 4)),
+                    num_pred_tokens=int(self.config.get("prompt_lookup_tokens", 12)),
+                )
+                logger.info(
+                    "Prompt-lookup speculative decoding enabled: ngram=%s draft_tokens=%s",
+                    self.config.get("prompt_lookup_ngram", 4),
+                    self.config.get("prompt_lookup_tokens", 12),
+                )
+            except Exception as exc:
+                logger.warning("Prompt-lookup speculative decoding unavailable: %s", exc)
+
         # Patch Jinja2 to support {% break %}/{% continue %} used by some GGUF chat
         # templates (e.g. Kimi K2.5). llama-cpp-python's Jinja2ChatFormatter creates an
         # ImmutableSandboxedEnvironment without loopcontrols, so we patch Environment.__init__
@@ -288,12 +350,16 @@ class LlamaCppBackend:
         # Initialize in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
         init_errors: List[str] = []
+        initialized_ctx: int | None = None
+        initialized_batch: int | None = None
         try:
             for candidate_ctx in _context_fallbacks(requested_n_ctx, max_safe_ctx):
                 kwargs["n_ctx"] = candidate_ctx
                 kwargs["n_batch"] = min(n_batch, candidate_ctx)
                 try:
                     self._llm = await loop.run_in_executor(None, lambda: Llama(**kwargs))
+                    initialized_ctx = candidate_ctx
+                    initialized_batch = int(kwargs["n_batch"])
                     if candidate_ctx != n_ctx:
                         logger.warning(
                             "Initialized with fallback n_ctx=%s after allocation failure at higher context",
@@ -307,14 +373,36 @@ class LlamaCppBackend:
                     continue
         finally:
             # Restore original Environment.__init__ to avoid side effects
-            try:
+            with contextlib.suppress(Exception):
                 jinja2.Environment.__init__ = _orig_env_init  # noqa: F821
-            except Exception:
-                pass
 
         if self._llm is None:
             errors = "; ".join(init_errors) if init_errors else "unknown initialization error"
             raise RuntimeError(f"Failed to initialize llama.cpp context after fallbacks: {errors}")
+
+        self._runtime_config = {
+            "n_ctx": initialized_ctx or n_ctx,
+            "n_threads": n_threads,
+            "n_threads_batch": n_threads_batch,
+            "n_batch": initialized_batch or min(n_batch, n_ctx),
+            "n_ubatch": n_ubatch,
+            "n_gpu_layers": n_gpu_layers,
+            "main_gpu": main_gpu,
+            "cache_type_k": cache_type_k,
+            "cache_type_v": cache_type_v,
+            "flash_attn": flash_attn,
+            "use_mmap": use_mmap,
+            "use_mlock": use_mlock,
+            "memory_mode": memory_mode,
+            "model_params_b": model_params_b,
+            "is_moe": is_moe,
+            "prompt_lookup": bool(self.config.get("prompt_lookup", False)),
+            "numa": numa,
+            "offload_kqv": offload_kqv,
+            "op_offload": op_offload,
+            "rope_freq_base": rope_freq_base,
+            "rope_freq_scale": rope_freq_scale,
+        }
 
         logger.info("Llama model loaded successfully")
 
@@ -347,13 +435,33 @@ class LlamaCppBackend:
             )
             elapsed = time.perf_counter() - t0
 
-        text = result["choices"][0]["text"]
-        # Estimate tokens from completion usage or text length
-        usage = result.get("usage", {})
-        n_tokens = usage.get("completion_tokens", max(1, len(text.split())))
-        tps = n_tokens / elapsed if elapsed > 0 else 0
-        logger.info("Generation: %d tokens in %.1fs (%.2f tok/s)", n_tokens, elapsed, tps)
+        text = str(result["choices"][0]["text"])
+        usage_raw = result.get("usage", {})
+        usage = usage_raw if isinstance(usage_raw, dict) else {}
+        n_tokens = _usage_int(usage, "completion_tokens", max(1, len(text.split())))
+        prompt_tokens = _usage_int(usage, "prompt_tokens", 0)
+        total_tokens = _usage_int(usage, "total_tokens", prompt_tokens + n_tokens)
+        tps = n_tokens / elapsed if elapsed > 0 else 0.0
+        total_tps = total_tokens / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "Generation: prompt=%d completion=%d total=%d in %.1fs "
+            "(decode %.2f tok/s, total %.2f tok/s)",
+            prompt_tokens,
+            n_tokens,
+            total_tokens,
+            elapsed,
+            tps,
+            total_tps,
+        )
         self._last_tps = tps
+        self._last_generation = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": n_tokens,
+            "total_tokens": total_tokens,
+            "elapsed_seconds": elapsed,
+            "decode_tps": tps,
+            "total_tps": total_tps,
+        }
 
         return text
 
@@ -401,6 +509,12 @@ class LlamaCppBackend:
             tps = n_tokens / elapsed if elapsed > 0 else 0
             logger.info("Stream: %d tokens in %.1fs (%.2f tok/s)", n_tokens, elapsed, tps)
             self._last_tps = tps
+            self._last_generation = {
+                "completion_chunks": n_tokens,
+                "elapsed_seconds": elapsed,
+                "chunk_tps": tps,
+                "streaming": True,
+            }
 
     async def get_info(self) -> Dict[str, Any]:
         """Get model information."""
@@ -415,6 +529,8 @@ class LlamaCppBackend:
             "n_params": getattr(self._llm, "n_params", "unknown"),
             "model_path": str(self.model_path),
             "last_tps": self._last_tps,
+            "last_generation": self._last_generation,
+            "runtime_config": self._runtime_config,
         }
 
     async def cleanup(self) -> None:

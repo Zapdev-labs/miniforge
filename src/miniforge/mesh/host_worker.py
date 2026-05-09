@@ -95,7 +95,7 @@ class HostWorkerEngine:
             logger.warning(f"Model {model_id} not registered, using local engine")
             
         if stream:
-            return self.local_engine.generate(
+            return await self.local_engine.generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -132,7 +132,7 @@ class HostWorkerEngine:
                 
         # Now run inference locally
         if stream:
-            return self.local_engine.generate(
+            return await self.local_engine.generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
