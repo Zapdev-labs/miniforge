@@ -37,6 +37,9 @@ class DistributedInferenceEngine:
         # Track assigned jobs
         self._active_jobs: Dict[str, InferenceJob] = {}
         
+        # Register as inference handler
+        self.coordinator.set_inference_handler(self._on_inference_request)
+        
     async def generate(
         self,
         prompt: str,
@@ -240,21 +243,18 @@ class DistributedInferenceEngine:
             
     def _get_connection_to_node(self, node_id: str) -> Optional[MeshConnection]:
         """Get connection to a specific node."""
-        connections = self.coordinator.transport.connections
-        for conn in connections.values():
-            # TODO: Track node_id -> connection mapping
-            return conn
-        return None
+        return self.coordinator.transport.get_connection_by_node_id(node_id)
         
-    async def handle_remote_request(
+    async def _on_inference_request(
         self,
-        job_id: str,
-        prompt: str,
-        model_id: str,
-        max_tokens: int,
+        payload: Dict[str, Any],
         conn: MeshConnection,
     ) -> None:
-        """Handle incoming inference request from remote node."""
+        """Handle incoming inference request from remote node (coordinator callback)."""
+        job_id = payload.get("job_id", "unknown")
+        prompt = payload.get("prompt", "")
+        max_tokens = payload.get("max_tokens", 512)
+        
         logger.info(f"Handling remote request {job_id}")
         
         try:

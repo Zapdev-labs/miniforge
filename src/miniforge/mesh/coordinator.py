@@ -85,6 +85,7 @@ class MeshCoordinator:
         
         # Callbacks
         self._state_callbacks: List[Callable[[], None]] = []
+        self._inference_handler: Optional[Callable[[Dict[str, Any], "MeshConnection"], Any]] = None
         
         # Tasks
         self._running = False
@@ -132,6 +133,13 @@ class MeshCoordinator:
     def on_state_change(self, callback: Callable[[], None]) -> None:
         """Register callback for state changes."""
         self._state_callbacks.append(callback)
+        
+    def set_inference_handler(self, handler: Callable[[Dict[str, Any], "MeshConnection"], Any]) -> None:
+        """Set handler for remote inference requests.
+        
+        Handler receives (payload_dict, connection) and should send the response.
+        """
+        self._inference_handler = handler
         
     def _notify_state_change(self) -> None:
         """Notify all state change callbacks."""
@@ -296,12 +304,18 @@ class MeshCoordinator:
             )
             self._notify_state_change()
             
+
+                
     def _on_connection_event(self, peer_id: str, conn: MeshConnection, event: str) -> None:
         """Handle transport connection events."""
         if event == "connected":
             logger.info(f"Connected to {peer_id}")
-            # Register handlers for inference requests
-            conn.on("inference_request", self._handle_inference_request)
+            # Register handlers for inference requests with connection capture
+            def _make_request_handler(c: MeshConnection):
+                async def _handler(payload: Dict[str, Any]) -> None:
+                    await self._handle_inference_request(payload, c)
+                return _handler
+            conn.on("inference_request", _make_request_handler(conn))
             conn.on("inference_response", self._handle_inference_response)
             conn.on("heartbeat", self._handle_heartbeat)
         elif event == "disconnected":
@@ -310,7 +324,7 @@ class MeshCoordinator:
                 self._nodes[peer_id].status = "offline"
                 self._notify_state_change()
                 
-    async def _handle_inference_request(self, payload: Dict[str, Any]) -> None:
+    async def _handle_inference_request(self, payload: Dict[str, Any], conn: MeshConnection) -> None:
         """Handle incoming inference request from peer."""
         job_id = payload.get("job_id")
         prompt = payload.get("prompt")
@@ -319,8 +333,23 @@ class MeshCoordinator:
         
         logger.info(f"Received inference request {job_id} from peer")
         
-        # TODO: Execute inference using local engine
-        # For now, just acknowledge
+        if self._inference_handler:
+            try:
+                await self._inference_handler(payload, conn)
+            except Exception as e:
+                logger.error(f"Inference handler error for {job_id}: {e}")
+                await conn.send("inference_response", {
+                    "job_id": job_id,
+                    "result": f"[Error: {e}]",
+                    "status": "failed",
+                })
+        else:
+            logger.warning(f"No inference handler registered for job {job_id}")
+            await conn.send("inference_response", {
+                "job_id": job_id,
+                "result": "[Error: No inference handler registered]",
+                "status": "failed",
+            })
         
     async def _handle_inference_response(self, payload: Dict[str, Any]) -> None:
         """Handle inference response from peer."""

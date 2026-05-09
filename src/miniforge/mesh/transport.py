@@ -36,10 +36,12 @@ class MeshConnection:
         writer: asyncio.StreamWriter,
         node_id: str,
         security: MeshSecurity,
+        peer_node_id: str = "unknown",
     ):
         self.reader = reader
         self.writer = writer
         self.node_id = node_id
+        self.peer_node_id = peer_node_id
         self.security = security
         self.connected_at = time.time()
         self.last_seen = time.time()
@@ -170,6 +172,7 @@ class MeshTransport:
         self.security = security
         
         self._connections: Dict[str, MeshConnection] = {}
+        self._node_id_to_connection: Dict[str, MeshConnection] = {}
         self._callbacks: List[Callable[[str, MeshConnection, str], None]] = []
         self._running = False
         self._server: Optional[asyncio.Server] = None
@@ -200,6 +203,10 @@ class MeshTransport:
     def connections(self) -> Dict[str, MeshConnection]:
         """Return current connections."""
         return dict(self._connections)
+        
+    def get_connection_by_node_id(self, node_id: str) -> Optional[MeshConnection]:
+        """Return connection to a specific peer by node ID."""
+        return self._node_id_to_connection.get(node_id)
         
     async def start(self) -> None:
         """Start transport server and heartbeat."""
@@ -274,11 +281,12 @@ class MeshTransport:
             peer_id = parts[1] if len(parts) > 1 else "unknown"
             
             # Create connection
-            conn = MeshConnection(reader, writer, self.node_id, self.security)
+            conn = MeshConnection(reader, writer, self.node_id, self.security, peer_node_id=peer_id)
             conn.on("heartbeat", lambda _: None)  # Update last_seen
             await conn.start()
             
             self._connections[peer_key] = conn
+            self._node_id_to_connection[peer_id] = conn
             self._notify(peer_id, conn, "connected")
             
             logger.info(f"Connected to peer {peer_id} @ {peer_key}")
@@ -327,10 +335,11 @@ class MeshTransport:
             await writer.drain()
             
             # Create connection
-            conn = MeshConnection(reader, writer, self.node_id, self.security)
+            conn = MeshConnection(reader, writer, self.node_id, self.security, peer_node_id=peer_id)
             await conn.start()
             
             self._connections[peer_key] = conn
+            self._node_id_to_connection[peer_id] = conn
             self._notify(peer_id, conn, "connected")
             
             logger.info(f"Accepted connection from {peer_name} ({peer_id}) @ {peer_key}")
@@ -345,7 +354,9 @@ class MeshTransport:
             logger.warning(f"Error handling incoming from {peer_addr}: {e}")
         finally:
             if peer_key in self._connections:
-                del self._connections[peer_key]
+                conn = self._connections.pop(peer_key)
+                if conn.peer_node_id in self._node_id_to_connection:
+                    del self._node_id_to_connection[conn.peer_node_id]
                 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats to all peers."""
@@ -379,6 +390,8 @@ class MeshTransport:
         ]
         for key in stale:
             conn = self._connections.pop(key)
-            self._notify(conn.node_id, conn, "disconnected")
+            if conn.peer_node_id in self._node_id_to_connection:
+                del self._node_id_to_connection[conn.peer_node_id]
+            self._notify(conn.peer_node_id, conn, "disconnected")
             await conn.stop()
             logger.info(f"Removed stale connection to {key}")
