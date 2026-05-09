@@ -186,18 +186,16 @@ class MeshDiscovery:
         # Scan common ports on each host (limited to avoid flooding)
         ports_to_check = [self.mesh_port]
         
-        # Create scan tasks for all hosts
-        tasks = []
+        # Collect hosts to scan
         hosts = list(network.hosts())[:50]  # Limit to first 50 hosts
+        targets = [
+            (str(h), p)
+            for h in hosts
+            for p in ports_to_check
+            if str(h) != local_ip
+        ]
         
-        for host in hosts:
-            host_str = str(host)
-            if host_str == local_ip:
-                continue
-            for port in ports_to_check:
-                tasks.append(self._check_host(host_str, port))
-                
-        if not tasks:
+        if not targets:
             return
             
         # Run checks with semaphore to limit concurrency
@@ -208,10 +206,8 @@ class MeshDiscovery:
                 await self._check_host(host, port)
                 
         await asyncio.gather(*[
-            check_with_limit(str(h), p) 
-            for h in hosts[:50] 
-            for p in ports_to_check
-            if str(h) != local_ip
+            check_with_limit(host, port)
+            for host, port in targets
         ], return_exceptions=True)
         
     async def _check_host(self, host: str, port: int) -> None:
