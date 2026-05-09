@@ -365,6 +365,7 @@ class MeshTransport:
                 for peer_key, conn in list(self._connections.items()):
                     try:
                         await conn.send("heartbeat", {
+                            "node_id": self.node_id,
                             "ram_available": self.ram_gb,  # TODO: get actual available
                             "cpu_percent": 0.0,  # TODO: get actual
                             "timestamp": time.time(),
