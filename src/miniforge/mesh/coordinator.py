@@ -83,6 +83,10 @@ class MeshCoordinator:
         self._leader_id: Optional[str] = None
         self._started_at = time.time()
         
+        # Job counter for round-robin load balancing
+        self._node_job_counts: Dict[str, int] = {}
+        self._last_route_index = 0
+        
         # Callbacks
         self._state_callbacks: List[Callable[[], None]] = []
         self._inference_handler: Optional[Callable[[Dict[str, Any], "MeshConnection"], Any]] = None
@@ -261,20 +265,29 @@ class MeshCoordinator:
         return 10.0  # Default
         
     def _select_least_loaded_node(self) -> str:
-        """Select least-loaded node for job routing."""
+        """Select least-loaded node for job routing using round-robin."""
         candidates = self.all_nodes
         
         # Filter to active nodes
         active = [n for n in candidates if n.status == "active"]
         if not active:
             return self.node_id  # Fallback to self
-            
-        # Sort by CPU usage then available RAM
+        
+        # Update job counts for nodes we know about
+        for n in active:
+            if n.node_id not in self._node_job_counts:
+                self._node_job_counts[n.node_id] = 0
+        
+        # Find node with fewest active jobs (round-robin tiebreaker)
         sorted_nodes = sorted(
             active,
-            key=lambda n: (n.cpu_percent, -n.ram_available)
+            key=lambda n: (self._node_job_counts.get(n.node_id, 0), n.node_id)
         )
-        return sorted_nodes[0].node_id
+        
+        winner = sorted_nodes[0].node_id
+        self._node_job_counts[winner] = self._node_job_counts.get(winner, 0) + 1
+        logger.info(f"Routed job to {winner} (active jobs: {self._node_job_counts[winner]})")
+        return winner
         
     async def _on_peer_event(self, peer: PeerInfo, event: str) -> None:
         """Handle peer discovery events."""
@@ -361,6 +374,9 @@ class MeshCoordinator:
             job.result = result
             job.status = "completed"
             job.completed_at = time.time()
+            # Decrement job counter for the node that handled this
+            if job.assigned_node and job.assigned_node in self._node_job_counts:
+                self._node_job_counts[job.assigned_node] = max(0, self._node_job_counts[job.assigned_node] - 1)
             self._notify_state_change()
             
     async def _handle_heartbeat(self, payload: Dict[str, Any]) -> None:
