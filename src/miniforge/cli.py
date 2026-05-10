@@ -361,6 +361,14 @@ def main():
     _add_runtime_arguments(webui_parser, include_generation=False)
     webui_parser.set_defaults(func=cmd_webui)
 
+    # Mesh command (distributed inference)
+    try:
+        from miniforge.mesh.cli import add_mesh_subparser
+
+        add_mesh_subparser(subparsers)
+    except ImportError:
+        pass
+
     # Download command
     download_parser = subparsers.add_parser("download", help="Download model")
     download_parser.add_argument("model", help="Model ID to download")

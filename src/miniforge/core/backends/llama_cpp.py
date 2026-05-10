@@ -2,55 +2,49 @@
 
 import asyncio
 import contextlib
-import inspect
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
-from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 MAX_MINIMAX_TRAINED_CTX = 196_608  # MiniMax trained context window
 CTX_SAFETY_HEADROOM = 2_048  # Reserve for generation
 DEFAULT_OPTIMAL_CTX = 194_560  # 192K usable context (196608 - 2048)
-GGML_TYPE_MAP: dict[str, int] = {
-    "F32": 0,
-    "F16": 1,
-    "Q4_0": 2,
-    "Q4_1": 3,
-    "Q5_0": 6,
-    "Q5_1": 7,
-    "Q8_0": 8,
-    "Q8_1": 9,
-    "Q2_K": 10,
-    "Q3_K": 11,
-    "Q4_K": 12,
-    "Q5_K": 13,
-    "Q6_K": 14,
-    "IQ4_NL": 20,
-}
-KV_ALIAS_MAP: dict[str, str] = {
-    "f16": "F16",
-    "fp16": "F16",
-    "f32": "F32",
-    "fp32": "F32",
-    "q8_0": "Q8_0",
-    "q5_0": "Q5_0",
-    "q5_1": "Q5_1",
-    "q4_0": "Q4_0",
-    "q4_1": "Q4_1",
-}
-KV_FALLBACK_CHAINS: dict[str, list[str]] = {
-    "turbo3": ["q4_0", "q8_0"],
-    "turbo4": ["q4_0", "q8_0"],
-}
 
 
-def _resolve_kv_cache_types(cache_type_k: Any, cache_type_v: Any) -> tuple[int | None, int | None]:
-    """Convert user-facing KV cache names to llama-cpp enum values."""
+def _resolve_kv_cache_types(
+    cache_type_k: Any, cache_type_v: Any
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Convert user-friendly KV cache type values to llama-cpp enum ints.
+
+    Newer llama-cpp builds require integer ggml type enums for type_k/type_v.
+    Falls back through a chain: turbo3 -> q4_0 -> q8_0 -> None (f16 default).
+    """
+    # Hardcoded ggml_type enum values — used when the Python binding
+    # doesn't expose GGMLType (older llama-cpp-python builds).
+    # Values from ggml/include/ggml.h enum ggml_type.
+    _GGML_TYPE_MAP: Dict[str, int] = {
+        "F32": 0,
+        "F16": 1,
+        "Q4_0": 2,
+        "Q4_1": 3,
+        "Q5_0": 6,
+        "Q5_1": 7,
+        "Q8_0": 8,
+        "Q8_1": 9,
+        "Q2_K": 10,
+        "Q3_K": 11,
+        "Q4_K": 12,
+        "Q5_K": 13,
+        "Q6_K": 14,
+        "IQ4_NL": 20,
+    }
+
+    # Try runtime enum first, fall back to hardcoded map
     try:
         import llama_cpp
 
@@ -58,7 +52,25 @@ def _resolve_kv_cache_types(cache_type_k: Any, cache_type_v: Any) -> tuple[int |
     except Exception:
         ggml_enum = None
 
-    def _convert(value: Any) -> int | None:
+    alias_map: Dict[str, str] = {
+        "f16": "F16",
+        "fp16": "F16",
+        "f32": "F32",
+        "fp32": "F32",
+        "q8_0": "Q8_0",
+        "q5_0": "Q5_0",
+        "q5_1": "Q5_1",
+        "q4_0": "Q4_0",
+        "q4_1": "Q4_1",
+    }
+
+    # Fallback chain for aggressive cache types that may not be supported
+    _FALLBACK_CHAINS: Dict[str, List[str]] = {
+        "turbo3": ["q4_0", "q8_0"],
+        "turbo4": ["q4_0", "q8_0"],
+    }
+
+    def _convert(value: Any) -> Optional[int]:
         if value is None:
             return None
         if isinstance(value, int):
@@ -68,11 +80,13 @@ def _resolve_kv_cache_types(cache_type_k: Any, cache_type_v: Any) -> tuple[int |
 
         normalized = value.strip().lower()
 
-        candidates = [normalized] + KV_FALLBACK_CHAINS.get(normalized, [])
+        # Build candidate list: requested type first, then fallbacks
+        candidates = [normalized] + _FALLBACK_CHAINS.get(normalized, [])
 
         for candidate in candidates:
-            enum_name = KV_ALIAS_MAP.get(candidate, candidate.upper())
+            enum_name = alias_map.get(candidate, candidate.upper())
 
+            # Try runtime enum first
             if ggml_enum is not None:
                 enum_value = getattr(ggml_enum, enum_name, None)
                 if enum_value is not None:
@@ -80,17 +94,18 @@ def _resolve_kv_cache_types(cache_type_k: Any, cache_type_v: Any) -> tuple[int |
                         logger.info("KV cache: '%s' -> '%s' (via runtime enum)", value, candidate)
                     return int(enum_value)
 
-            if enum_name in GGML_TYPE_MAP:
+            # Fall back to hardcoded values
+            if enum_name in _GGML_TYPE_MAP:
                 if candidate != normalized:
                     logger.info("KV cache: '%s' -> '%s' (via hardcoded enum)", value, candidate)
-                return GGML_TYPE_MAP[enum_name]
+                return _GGML_TYPE_MAP[enum_name]
 
         return None
 
     return _convert(cache_type_k), _convert(cache_type_v)
 
 
-def _context_fallbacks(requested_n_ctx: int, max_safe_ctx: int) -> list[int]:
+def _context_fallbacks(requested_n_ctx: int, max_safe_ctx: int) -> List[int]:
     first = min(requested_n_ctx, max_safe_ctx)
     candidates = [
         first,
@@ -104,7 +119,7 @@ def _context_fallbacks(requested_n_ctx: int, max_safe_ctx: int) -> list[int]:
         8_192,
         4_096,
     ]
-    unique: list[int] = []
+    unique: List[int] = []
     for value in candidates:
         if 1024 <= value <= max_safe_ctx and value not in unique:
             unique.append(value)
@@ -112,7 +127,6 @@ def _context_fallbacks(requested_n_ctx: int, max_safe_ctx: int) -> list[int]:
 
 
 def _infer_model_params_from_path(model_path: Path) -> float | None:
-    """Infer parameter count from common local GGUF filenames like Qwen3-8B."""
     haystack = " ".join([model_path.name, model_path.parent.name])
     matches = re.findall(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[bB](?![A-Za-z])", haystack)
     for raw in matches:
@@ -125,46 +139,6 @@ def _infer_model_params_from_path(model_path: Path) -> float | None:
     return None
 
 
-def _auto_dense_context_limit(model_params_b: float) -> int:
-    """Protect dense models from paying huge KV-cache costs by default."""
-    if model_params_b <= 12.0:
-        return 32_768
-    if model_params_b <= 34.0:
-        return 24_576
-    if model_params_b <= 80.0:
-        return 16_384
-    return 8_192
-
-
-def _apply_hardware_auto_tuning(
-    config: dict[str, Any], model_params_b: float | None, is_moe: bool
-) -> None:
-    """Fill default backend settings from hardware detection for direct GGUF usage."""
-    if not bool(config.get("auto_context", True)) or model_params_b is None:
-        return
-
-    try:
-        from miniforge.utils.config import M7Config
-        from miniforge.utils.hardware import auto_config
-    except Exception as exc:
-        logger.debug("Hardware auto-tuning unavailable: %s", exc)
-        return
-
-    defaults = M7Config().get_backend_config()
-    try:
-        tuned = auto_config(model_params_b=model_params_b, is_moe=is_moe)
-    except Exception as exc:
-        logger.debug("Hardware auto-tuning failed: %s", exc)
-        return
-
-    for key, tuned_value in tuned.items():
-        if key in {"n_ctx", "model_params_b", "is_moe"}:
-            continue
-        current_value = config.get(key)
-        if key not in config or current_value == defaults.get(key):
-            config[key] = tuned_value
-
-
 def _usage_int(usage: dict[str, Any], key: str, default: int) -> int:
     value = usage.get(key, default)
     if isinstance(value, int):
@@ -172,38 +146,6 @@ def _usage_int(usage: dict[str, Any], key: str, default: int) -> int:
     if isinstance(value, float):
         return int(value)
     return default
-
-
-def _supports_kwargs(callable_obj: Any) -> bool:
-    try:
-        signature = inspect.signature(callable_obj)
-    except (TypeError, ValueError):
-        return True
-    return any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    )
-
-
-def _filter_supported_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Filter keyword arguments to those accepted by callable_obj."""
-    if _supports_kwargs(callable_obj):
-        return kwargs
-    try:
-        signature = inspect.signature(callable_obj)
-    except (TypeError, ValueError):
-        return kwargs
-    accepted = set(signature.parameters.keys())
-    filtered: dict[str, Any] = {}
-    dropped: list[str] = []
-    for key, value in kwargs.items():
-        if key in accepted:
-            filtered[key] = value
-        else:
-            dropped.append(key)
-    if dropped:
-        logger.debug("Dropping unsupported llama-cpp kwargs: %s", ", ".join(sorted(dropped)))
-    return filtered
 
 
 class LlamaCppBackend:
@@ -217,64 +159,25 @@ class LlamaCppBackend:
     - Flash Attention
     """
 
-    def __init__(self, model_path: Path, config: dict[str, Any]):
+    def __init__(self, model_path: Path, config: Dict[str, Any]):
         self.model_path = model_path
         self.config = config
-        self._llm: Any | None = None
+        self._llm = None
         self._lock = asyncio.Lock()
         self._last_tps: float = 0.0
         self._last_generation: dict[str, Any] = {}
         self._runtime_config: dict[str, Any] = {}
 
-    def _build_completion_kwargs(
-        self,
-        prompt: str,
-        max_tokens: int,
-        temperature: float,
-        top_p: float,
-        top_k: int,
-        stop: list[str] | None,
-        *,
-        stream: bool,
-    ) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "stop": stop or [],
-            "stream": stream,
-        }
-        optional_generation: dict[str, Any] = {
-            "min_p": self.config.get("min_p"),
-            "typical_p": self.config.get("typical_p"),
-            "repeat_penalty": self.config.get("repeat_penalty"),
-            "presence_penalty": self.config.get("presence_penalty"),
-            "frequency_penalty": self.config.get("frequency_penalty"),
-            "mirostat_mode": self.config.get("mirostat_mode"),
-            "mirostat_tau": self.config.get("mirostat_tau"),
-            "mirostat_eta": self.config.get("mirostat_eta"),
-            "seed": self.config.get("seed"),
-            "tfs_z": self.config.get("tfs_z"),
-            "speculative_n_max": self.config.get("speculative_n_max"),
-            "speculative_n_min": self.config.get("speculative_n_min"),
-            "speculative_p_min": self.config.get("speculative_p_min"),
-        }
-        for key, value in optional_generation.items():
-            if value is not None:
-                kwargs[key] = value
-        return kwargs
-
     async def initialize(self) -> None:
         """Initialize the Llama model with performance optimizations."""
         try:
             from llama_cpp import Llama
-        except ImportError as exc:
+        except ImportError:
             raise ImportError(
                 "llama-cpp-python not installed. Install with: uv pip install llama-cpp-python"
-            ) from exc
+            )
 
+        # Extract configuration with M7-optimized defaults for full 192K context
         requested_n_ctx = int(self.config.get("n_ctx", DEFAULT_OPTIMAL_CTX))
         model_params_raw = self.config.get("model_params_b")
         model_params_b = (
@@ -282,23 +185,7 @@ class LlamaCppBackend:
             if isinstance(model_params_raw, (int, float))
             else _infer_model_params_from_path(self.model_path)
         )
-        is_moe = bool(self.config.get("is_moe", False))
-        _apply_hardware_auto_tuning(self.config, model_params_b, is_moe)
-        if (
-            bool(self.config.get("auto_context", True))
-            and model_params_b is not None
-            and not is_moe
-        ):
-            auto_limit = _auto_dense_context_limit(model_params_b)
-            if requested_n_ctx > auto_limit:
-                logger.info(
-                    "Auto context: reducing dense %.1fB model n_ctx %s -> %s. "
-                    "Set auto_context=False or MINIFORGE_N_CTX to override.",
-                    model_params_b,
-                    requested_n_ctx,
-                    auto_limit,
-                )
-                requested_n_ctx = auto_limit
+        # Per-model context cap: MiniMax=196K, Kimi K2.5=262K, others use MiniMax default
         model_max_ctx = int(self.config.get("max_model_ctx", MAX_MINIMAX_TRAINED_CTX))
         max_safe_ctx = model_max_ctx - CTX_SAFETY_HEADROOM
         n_ctx = min(requested_n_ctx, max_safe_ctx)
@@ -310,31 +197,38 @@ class LlamaCppBackend:
                 n_ctx,
             )
 
+        # CPU/GPU settings
         n_threads = self.config.get("n_threads", 8)
-        n_batch = self.config.get("n_batch", 2048)
-        n_ubatch = self.config.get("n_ubatch", 512)
+        n_threads_batch = self.config.get("n_threads_batch", n_threads)
+        n_batch = self.config.get("n_batch", 2048)  # Larger batch for 192K context
+        n_ubatch = self.config.get("n_ubatch", 512)  # Micro-batch for chunked processing
         n_gpu_layers = self.config.get("n_gpu_layers", 0)
         main_gpu = self.config.get("main_gpu", 0)
 
+        # KV cache quantization (TurboQuant - aggressive compression for 192K)
         cache_type_k = self.config.get("cache_type_k", "turbo3")
         cache_type_v = self.config.get("cache_type_v", "turbo3")
 
+        # Performance features
         flash_attn = self.config.get("flash_attn", True)
 
+        # Memory mapping (optimize for large context)
         use_mmap = self.config.get("use_mmap", True)
         use_mlock = self.config.get("use_mlock", False)
-
         memory_mode = str(self.config.get("memory_mode", "auto"))
-        if memory_mode == "resident" and not is_moe:
-            use_mmap = False
-            use_mlock = False
-        elif memory_mode in {"mmap", "paged_moe"}:
+
+        # MoE models: mmap is the mechanism that makes them runnable on limited RAM.
+        # Force mmap=True and mlock=False — locking 240+ GB in RAM would crash the system.
+        # AirLLM-inspired: also reduce batch sizes to minimize peak memory pressure,
+        # letting the OS page-cache hold more active expert weights in RAM.
+        is_moe = self.config.get("is_moe", False)
+        if memory_mode == "mmap":
             use_mmap = True
             use_mlock = False
-
         if is_moe:
             use_mmap = True
             use_mlock = False
+            # Smaller batches = less peak memory during prefill = more RAM for expert pages
             n_batch = min(n_batch, 512)
             n_ubatch = min(n_ubatch, 256)
             if n_ctx > 32_768:
@@ -344,14 +238,18 @@ class LlamaCppBackend:
                     n_ctx,
                 )
 
-        rope_freq_base = self.config.get("rope_freq_base", 10000.0)
-        rope_freq_scale = self.config.get("rope_freq_scale", 1.0)
+        # RoPE settings for long context
+        rope_freq_base = float(self.config.get("rope_freq_base", 0.0))
+        rope_freq_scale = float(self.config.get("rope_freq_scale", 0.0))
+        numa = bool(self.config.get("numa", False))
+        offload_kqv = bool(self.config.get("offload_kqv", True))
+        op_offload = self.config.get("op_offload")
 
-        logger.info("Loading model from %s", self.model_path)
-        logger.info("Context: %s tokens (model max: %s)", n_ctx, model_max_ctx)
-        logger.info("Threads: %s, Batch: %s/%s", n_threads, n_batch, n_ubatch)
-        logger.info("Memory mode: %s, mmap=%s, mlock=%s", memory_mode, use_mmap, use_mlock)
-        logger.info("KV cache: k=%s, v=%s, FlashAttn=%s", cache_type_k, cache_type_v, flash_attn)
+        logger.info(f"Loading model from {self.model_path}")
+        logger.info(f"Context: {n_ctx} tokens (model max: {model_max_ctx})")
+        logger.info(f"Threads: {n_threads}, Batch threads: {n_threads_batch}, Batch: {n_batch}/{n_ubatch}")
+        logger.info(f"Memory mode: {memory_mode}, mmap={use_mmap}, mlock={use_mlock}")
+        logger.info(f"KV cache: k={cache_type_k}, v={cache_type_v}, FlashAttn={flash_attn}")
         if is_moe:
             logger.info(
                 "MoE model: mmap=True, mlock=False, batch=%d/%d (active experts paged from disk)",
@@ -359,38 +257,36 @@ class LlamaCppBackend:
                 n_ubatch,
             )
         if n_gpu_layers > 0:
-            logger.info("GPU layers: %s on device %s", n_gpu_layers, main_gpu)
+            logger.info(f"GPU layers: {n_gpu_layers} on device {main_gpu}")
 
-        kwargs: dict[str, Any] = {
+        # Build kwargs for Llama with all optimizations
+        kwargs = {
             "model_path": str(self.model_path),
             "n_ctx": n_ctx,
             "n_threads": n_threads,
+            "n_threads_batch": n_threads_batch,
             "n_batch": n_batch,
             "verbose": self.config.get("verbose", False),
             "use_mmap": use_mmap,
             "use_mlock": use_mlock,
             "rope_freq_base": rope_freq_base,
             "rope_freq_scale": rope_freq_scale,
+            "numa": numa,
+            "offload_kqv": offload_kqv,
             "chat_format": self.config.get("chat_format", None),
         }
-        optional_init_kwargs: dict[str, Any] = {
-            "n_threads_batch": self.config.get("n_threads_batch"),
-            "numa": self.config.get("numa"),
-            "seed": self.config.get("seed"),
-            "offload_kqv": self.config.get("offload_kqv"),
-            "mul_mat_q": self.config.get("mul_mat_q"),
-            "f16_kv": self.config.get("f16_kv"),
-        }
-        for key, value in optional_init_kwargs.items():
-            if value is not None:
-                kwargs[key] = value
+        if isinstance(op_offload, bool):
+            kwargs["op_offload"] = op_offload
 
+        # Add micro-batch size if supported (helps with 192K context)
         if n_ubatch != n_batch:
             kwargs["n_ubatch"] = n_ubatch
 
+        # Flash Attention - critical for 192K context performance
         if flash_attn:
             kwargs["flash_attn"] = flash_attn
 
+        # KV cache types (TurboQuant for memory efficiency)
         type_k, type_v = _resolve_kv_cache_types(cache_type_k, cache_type_v)
         if type_k is not None:
             kwargs["type_k"] = type_k
@@ -407,19 +303,39 @@ class LlamaCppBackend:
                 cache_type_v,
             )
 
+        # GPU layers (for AMD iGPU or discrete GPU)
         if n_gpu_layers > 0:
             kwargs["n_gpu_layers"] = n_gpu_layers
             kwargs["main_gpu"] = main_gpu
             if "tensor_split" in self.config:
                 kwargs["tensor_split"] = self.config["tensor_split"]
 
-        _orig_env_init: Any | None = None
+        if self.config.get("prompt_lookup", False):
+            try:
+                from llama_cpp.llama_speculative import LlamaPromptLookupDecoding
+
+                kwargs["draft_model"] = LlamaPromptLookupDecoding(
+                    max_ngram_size=int(self.config.get("prompt_lookup_ngram", 4)),
+                    num_pred_tokens=int(self.config.get("prompt_lookup_tokens", 12)),
+                )
+                logger.info(
+                    "Prompt-lookup speculative decoding enabled: ngram=%s draft_tokens=%s",
+                    self.config.get("prompt_lookup_ngram", 4),
+                    self.config.get("prompt_lookup_tokens", 12),
+                )
+            except Exception as exc:
+                logger.warning("Prompt-lookup speculative decoding unavailable: %s", exc)
+
+        # Patch Jinja2 to support {% break %}/{% continue %} used by some GGUF chat
+        # templates (e.g. Kimi K2.5). llama-cpp-python's Jinja2ChatFormatter creates an
+        # ImmutableSandboxedEnvironment without loopcontrols, so we patch Environment.__init__
+        # to inject the extension automatically.
         try:
             import jinja2
 
             _orig_env_init = jinja2.Environment.__init__
 
-            def _env_init_with_loopcontrols(self: Any, *args: Any, **kwargs: Any) -> None:
+            def _env_init_with_loopcontrols(self, *args, **kwargs):
                 ext = kwargs.get("extensions") or []
                 lc = "jinja2.ext.loopcontrols"
                 if lc not in ext:
@@ -427,24 +343,23 @@ class LlamaCppBackend:
                 kwargs["extensions"] = ext
                 _orig_env_init(self, *args, **kwargs)
 
-            jinja2.Environment.__init__ = _env_init_with_loopcontrols  # type: ignore[method-assign]
+            jinja2.Environment.__init__ = _env_init_with_loopcontrols
         except Exception:
             pass
 
-        loop = asyncio.get_running_loop()
-        init_errors: list[str] = []
+        # Initialize in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        init_errors: List[str] = []
         initialized_ctx: int | None = None
         initialized_batch: int | None = None
         try:
             for candidate_ctx in _context_fallbacks(requested_n_ctx, max_safe_ctx):
-                candidate_kwargs = dict(kwargs)
-                candidate_kwargs["n_ctx"] = candidate_ctx
-                candidate_kwargs["n_batch"] = min(n_batch, candidate_ctx)
-                candidate_kwargs = _filter_supported_kwargs(Llama, candidate_kwargs)
+                kwargs["n_ctx"] = candidate_ctx
+                kwargs["n_batch"] = min(n_batch, candidate_ctx)
                 try:
-                    self._llm = await loop.run_in_executor(None, partial(Llama, **candidate_kwargs))
+                    self._llm = await loop.run_in_executor(None, lambda: Llama(**kwargs))
                     initialized_ctx = candidate_ctx
-                    initialized_batch = int(candidate_kwargs["n_batch"])
+                    initialized_batch = int(kwargs["n_batch"])
                     if candidate_ctx != n_ctx:
                         logger.warning(
                             "Initialized with fallback n_ctx=%s after allocation failure at higher context",
@@ -456,19 +371,10 @@ class LlamaCppBackend:
                     init_errors.append(f"n_ctx={candidate_ctx}: {message}")
                     logger.warning("Llama init failed with n_ctx=%s: %s", candidate_ctx, message)
                     continue
-                except TypeError as exc:
-                    message = str(exc)
-                    init_errors.append(f"n_ctx={candidate_ctx}: {message}")
-                    logger.warning(
-                        "Llama init rejected kwarg set at n_ctx=%s: %s",
-                        candidate_ctx,
-                        message,
-                    )
-                    continue
         finally:
-            if _orig_env_init is not None:
-                with contextlib.suppress(Exception):
-                    jinja2.Environment.__init__ = _orig_env_init  # type: ignore[method-assign]
+            # Restore original Environment.__init__ to avoid side effects
+            with contextlib.suppress(Exception):
+                jinja2.Environment.__init__ = _orig_env_init  # noqa: F821
 
         if self._llm is None:
             errors = "; ".join(init_errors) if init_errors else "unknown initialization error"
@@ -477,6 +383,7 @@ class LlamaCppBackend:
         self._runtime_config = {
             "n_ctx": initialized_ctx or n_ctx,
             "n_threads": n_threads,
+            "n_threads_batch": n_threads_batch,
             "n_batch": initialized_batch or min(n_batch, n_ctx),
             "n_ubatch": n_ubatch,
             "n_gpu_layers": n_gpu_layers,
@@ -489,6 +396,12 @@ class LlamaCppBackend:
             "memory_mode": memory_mode,
             "model_params_b": model_params_b,
             "is_moe": is_moe,
+            "prompt_lookup": bool(self.config.get("prompt_lookup", False)),
+            "numa": numa,
+            "offload_kqv": offload_kqv,
+            "op_offload": op_offload,
+            "rope_freq_base": rope_freq_base,
+            "rope_freq_scale": rope_freq_scale,
         }
 
         logger.info("Llama model loaded successfully")
@@ -500,31 +413,24 @@ class LlamaCppBackend:
         temperature: float = 1.0,
         top_p: float = 0.95,
         top_k: int = 40,
-        stop: list[str] | None = None,
+        stop: Optional[List[str]] = None,
     ) -> str:
         """Generate text synchronously."""
         if not self._llm:
             raise RuntimeError("Backend not initialized")
-        llm = self._llm
 
         async with self._lock:
-            loop = asyncio.get_running_loop()
+            loop = asyncio.get_event_loop()
             t0 = time.perf_counter()
             result = await loop.run_in_executor(
                 None,
-                lambda: llm.create_completion(
-                    **_filter_supported_kwargs(
-                        llm.create_completion,
-                        self._build_completion_kwargs(
-                            prompt=prompt,
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                            top_p=top_p,
-                            top_k=top_k,
-                            stop=stop,
-                            stream=False,
-                        ),
-                    )
+                lambda: self._llm.create_completion(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    stop=stop or [],
                 ),
             )
             elapsed = time.perf_counter() - t0
@@ -566,65 +472,51 @@ class LlamaCppBackend:
         temperature: float = 1.0,
         top_p: float = 0.95,
         top_k: int = 40,
-        stop: list[str] | None = None,
+        stop: Optional[List[str]] = None,
     ) -> AsyncIterator[str]:
         """Generate text with streaming."""
         if not self._llm:
             raise RuntimeError("Backend not initialized")
-        llm = self._llm
 
         async with self._lock:
-            loop = asyncio.get_running_loop()
+            loop = asyncio.get_event_loop()
+
+            # Create completion in thread pool
             stream = await loop.run_in_executor(
                 None,
-                lambda: llm.create_completion(
-                    **_filter_supported_kwargs(
-                        llm.create_completion,
-                        self._build_completion_kwargs(
-                            prompt=prompt,
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                            top_p=top_p,
-                            top_k=top_k,
-                            stop=stop,
-                            stream=True,
-                        ),
-                    )
+                lambda: self._llm.create_completion(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    stop=stop or [],
+                    stream=True,
                 ),
             )
 
+            # Stream tokens with TPS tracking
             t0 = time.perf_counter()
-            first_token_at: float | None = None
             n_tokens = 0
             for chunk in stream:
                 text = chunk["choices"][0].get("text", "")
                 if text:
-                    if first_token_at is None:
-                        first_token_at = time.perf_counter()
                     n_tokens += 1
                     yield text
-                await asyncio.sleep(0)
+                await asyncio.sleep(0)  # Allow other tasks
 
             elapsed = time.perf_counter() - t0
-            tps = n_tokens / elapsed if elapsed > 0 else 0.0
-            first_token_seconds = first_token_at - t0 if first_token_at is not None else None
-            logger.info(
-                "Stream: %d chunks in %.1fs (%.2f chunk/s, first token %s)",
-                n_tokens,
-                elapsed,
-                tps,
-                f"{first_token_seconds:.2f}s" if first_token_seconds is not None else "n/a",
-            )
+            tps = n_tokens / elapsed if elapsed > 0 else 0
+            logger.info("Stream: %d tokens in %.1fs (%.2f tok/s)", n_tokens, elapsed, tps)
             self._last_tps = tps
             self._last_generation = {
-                "completion_tokens": n_tokens,
+                "completion_chunks": n_tokens,
                 "elapsed_seconds": elapsed,
-                "decode_tps": tps,
-                "first_token_seconds": first_token_seconds,
+                "chunk_tps": tps,
                 "streaming": True,
             }
 
-    async def get_info(self) -> dict[str, Any]:
+    async def get_info(self) -> Dict[str, Any]:
         """Get model information."""
         if not self._llm:
             return {"status": "not_initialized"}
