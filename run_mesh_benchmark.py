@@ -150,7 +150,7 @@ async def main():
 
     # Wait for mesh
     print("⏳ Waiting for mesh ...")
-    for _ in range(20):
+    for _ in range(60):  # Wait up to 2 minutes for peer
         await asyncio.sleep(2)
         if len(coordinator.all_nodes) > 1:
             break
@@ -163,10 +163,9 @@ async def main():
     print()
 
     if len(nodes) <= 1:
-        print("⚠️  No peers found. Exiting.")
-        await coordinator.stop()
-        await engine.cleanup()
-        return
+        print("⚠️  No peers found yet. Will continue with local-only tests.")
+        print("   (Peers may connect later via discovery)")
+        print()
 
     prompts = [
         "What is quantum computing?",
